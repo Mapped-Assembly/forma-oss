@@ -53,6 +53,17 @@ def _request(content: bytes, media_type: str) -> Request:
 
 
 class CliProjectArtifactApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cli_project_list_reads_shared_project_identities(self) -> None:
+        identities = [
+            {"project_id": "hosted-project", "creation_channel": "hosted", "title": "Hosted project"},
+            {"project_id": "cli-project", "creation_channel": "cli", "title": "CLI project"},
+        ]
+        with patch.object(cli_projects_api, "list_project_identities", return_value=identities) as list_identities:
+            response = await cli_projects_api.list_cli_projects_endpoint(_user())
+
+        list_identities.assert_called_once_with("user-a")
+        self.assertEqual(identities, response["items"])
+
     def setUp(self) -> None:
         self.content = b"native cad bytes"
         self.sha256 = hashlib.sha256(self.content).hexdigest()
@@ -170,6 +181,22 @@ class CliProjectArtifactApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(HTTPException, "SHA-256") as raised:
             await cli_projects_api.push_cli_project(request, _user())
         self.assertEqual(400, raised.exception.status_code)
+
+    async def test_push_rejects_unsupported_hardware_ir_before_persisting(self) -> None:
+        request = cli_projects_api.ProjectPushRequest(
+            manifest={
+                "format": "forma-project",
+                "project_id": "project-a",
+                "project_ir": {"hardware_ir_version": "9.0"},
+            }
+        )
+        with patch.object(cli_projects_api, "insert_cli_project_revision") as insert:
+            with self.assertRaises(HTTPException) as raised:
+                await cli_projects_api.push_cli_project(request, _user())
+
+        self.assertEqual(426, raised.exception.status_code)
+        self.assertEqual("UNSUPPORTED_HARDWARE_IR_VERSION", raised.exception.detail["code"])
+        insert.assert_not_called()
 
 
 if __name__ == "__main__":

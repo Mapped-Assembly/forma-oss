@@ -72,6 +72,11 @@ function meshesFromValue(value: unknown): MeshPayload[] {
   const record = asRecord(value);
   if (!record) return [];
 
+  if (Array.isArray(record.articulated_bodies)) {
+    const meshes = record.articulated_bodies.flatMap(meshesFromValue);
+    if (meshes.length) return meshes;
+  }
+
   for (const key of ["meshes", "mesh_payloads", "render_meshes"]) {
     if (key in record) {
       const meshes = meshesFromValue(record[key]);
@@ -204,6 +209,23 @@ function sourceDescriptor(value: unknown): CadModelDescriptor {
 export function projectCadModel(project: unknown): unknown {
   const record = asRecord(project);
   return record?.cad_model ?? null;
+}
+
+export function nativeStepArtifact(value: unknown): { projectId: string; sha256: string } | null {
+  const cad = asRecord(value);
+  if (cad?.adapter !== "forma-opencad" || cad.format !== "step") return null;
+  const projectId = nonEmptyString(cad.project_id);
+  const sha256 = nonEmptyString(cad.stored_sha256);
+  if (!projectId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(projectId)
+      || !sha256 || !/^[0-9a-f]{64}$/.test(sha256)) return null;
+  return { projectId, sha256 };
+}
+
+export function nativeStepDownloadPath(artifact: { projectId: string; sha256: string }, revisionId?: string): string {
+  const project = encodeURIComponent(artifact.projectId);
+  return revisionId
+    ? `/projects/${project}/history/${encodeURIComponent(revisionId)}/cad/${artifact.sha256}`
+    : `/opencode/projects/${project}/cad/${artifact.sha256}`;
 }
 
 export function resolveCadModel(value: unknown): CadModelDescriptor | null {

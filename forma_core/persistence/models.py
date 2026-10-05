@@ -21,6 +21,32 @@ class DBComponentTemplate(Base):
     use_cases = Column(JSON, nullable=False)
 
 
+class DBProject(Base):
+    """Canonical project identity shared by every creation channel."""
+
+    __tablename__ = "projects"
+
+    project_id = Column(String, primary_key=True)
+    owner_user_id = Column(String, index=True, nullable=True)
+    creation_channel = Column(String, nullable=False)
+    title = Column(String, nullable=False, default="")
+    prompt = Column(Text, nullable=False, default="")
+    chat_id = Column(String, index=True, nullable=True)
+    workspace_id = Column(String, nullable=True)
+    visibility = Column(String, index=True, nullable=False, default="public")
+    status = Column(String, index=True, nullable=False, default="active")
+    current_revision = Column(Integer, nullable=False, default=0)
+    current_revision_id = Column(String, nullable=True)
+    created_at = Column(String, nullable=False)
+    updated_at = Column(String, index=True, nullable=False)
+    deleted_at = Column(String, nullable=True)
+    deletion_requested_by = Column(String, nullable=True)
+    purge_after = Column(String, index=True, nullable=True)
+    purge_started_at = Column(String, nullable=True)
+    purge_completed_at = Column(String, nullable=True)
+    deletion_error = Column(Text, nullable=True)
+
+
 class DBGeneratedProject(Base):
     __tablename__ = "generated_projects"
 
@@ -28,6 +54,7 @@ class DBGeneratedProject(Base):
     project_id = Column(String, unique=True, index=True, nullable=False)
     chat_id = Column(String, index=True, nullable=True)
     owner_user_id = Column(String, index=True, nullable=True)
+    creation_channel = Column(String, nullable=False, default="hosted")
     visibility = Column(String, index=True, nullable=False, default="public")
     title = Column(String, nullable=False)
     prompt = Column(Text, nullable=False)
@@ -157,6 +184,8 @@ class DBCliProject(Base):
     workspace_id = Column(String, nullable=True)
     owner_user_id = Column(String, index=True, nullable=False)
     title = Column(String, nullable=False, default="")
+    creation_channel = Column(String, nullable=False, default="cli")
+    visibility = Column(String, nullable=False, default="public")
     current_revision = Column(Integer, nullable=False, default=0)
     current_revision_id = Column(String, nullable=True)
     created_at = Column(String, nullable=False)
@@ -178,6 +207,34 @@ class DBCliProjectRevision(Base):
     parent_revision_id = Column(String, nullable=True)
     manifest_json = Column(JSON, nullable=False)
     created_at = Column(String, index=True, nullable=False)
+
+
+class DBCliProjectDelivery(Base):
+    """Server-side idempotent delivery session for agent/CLI-created projects."""
+
+    __tablename__ = "cli_project_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "project_id",
+            "idempotency_key",
+            name="uq_cli_project_delivery_owner_project_key",
+        ),
+    )
+
+    delivery_id = Column(String, primary_key=True)
+    project_id = Column(String, index=True, nullable=False)
+    owner_user_id = Column(String, index=True, nullable=False)
+    idempotency_key = Column(String, nullable=False)
+    revision_id = Column(String, nullable=False)
+    revision = Column(Integer, nullable=False)
+    parent_revision_id = Column(String, nullable=True)
+    manifest_json = Column(JSON, nullable=False)
+    manifest_digest = Column(String, nullable=False, default="")
+    status = Column(String, index=True, nullable=False, default="pending")
+    receipt_json = Column(JSON, nullable=True)
+    created_at = Column(String, index=True, nullable=False)
+    completed_at = Column(String, nullable=True)
 
 
 class DBCliDeviceAuthorization(Base):
@@ -280,6 +337,19 @@ class DBProjectDeletionAudit(Base):
     created_at = Column(String, index=True, nullable=False)
 
 
+class DBProjectPublishAudit(Base):
+    """Audit record for an explicit publish (private-to-public) action."""
+
+    __tablename__ = "project_publish_audit"
+
+    id = Column(String, primary_key=True)
+    project_id = Column(String, index=True, nullable=False)
+    owner_user_id = Column(String, index=True, nullable=False)
+    acting_user_id = Column(String, index=True, nullable=False)
+    visibility_before = Column(String, nullable=False)
+    created_at = Column(String, index=True, nullable=False)
+
+
 class DBProjectChat(Base):
     __tablename__ = "project_chats"
 
@@ -355,3 +425,15 @@ class DBUserSettings(Base):
     model_training_opt_out = Column(Boolean, nullable=False, default=False)
     created_at = Column(String, nullable=False)
     updated_at = Column(String, nullable=False)
+
+
+class DBComponentAssetVersion(Base):
+    """Immutable component metadata; blobs use ProjectArtifactStorage."""
+    __tablename__ = "component_asset_versions"
+    asset_id = Column(String, primary_key=True)
+    version = Column(String, primary_key=True)
+    scope_key = Column(String, nullable=False, index=True)
+    identity_key = Column(String, nullable=False, index=True)
+    family_key = Column(String, nullable=False, index=True)
+    payload_json = Column(JSON, nullable=False)
+    created_at = Column(String, nullable=False)

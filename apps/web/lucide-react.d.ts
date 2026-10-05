@@ -17,6 +17,7 @@ declare module "lucide-react" {
   export const Box: LucideIcon;
   export const Check: LucideIcon;
   export const CheckCircle: LucideIcon;
+  export const CheckCircle2: LucideIcon;
   export const ChevronDown: LucideIcon;
   export const CircuitBoard: LucideIcon;
   export const Clapperboard: LucideIcon;
@@ -30,6 +31,9 @@ declare module "lucide-react" {
   export const Download: LucideIcon;
   export const ExternalLink: LucideIcon;
   export const Eye: LucideIcon;
+  export const FileBox: LucideIcon;
+  export const FileJson: LucideIcon;
+  export const FileText: LucideIcon;
   export const Film: LucideIcon;
   export const FlaskConical: LucideIcon;
   export const GitBranch: LucideIcon;
@@ -40,6 +44,7 @@ declare module "lucide-react" {
   export const KeyRound: LucideIcon;
   export const LayoutDashboard: LucideIcon;
   export const Layers: LucideIcon;
+  export const Loader2: LucideIcon;
   export const LoaderCircle: LucideIcon;
   export const Mail: LucideIcon;
   export const Maximize2: LucideIcon;
@@ -60,6 +65,7 @@ declare module "lucide-react" {
   export const RefreshCw: LucideIcon;
   export const Save: LucideIcon;
   export const Search: LucideIcon;
+  export const Share2: LucideIcon;
   export const Settings: LucideIcon;
   export const ShieldCheck: LucideIcon;
   export const Sliders: LucideIcon;
@@ -70,6 +76,7 @@ declare module "lucide-react" {
   export const Sun: LucideIcon;
   export const Terminal: LucideIcon;
   export const Trash2: LucideIcon;
+  export const TriangleAlert: LucideIcon;
   export const Volume2: LucideIcon;
   export const Wrench: LucideIcon;
   export const X: LucideIcon;

@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from forma_cli.config import api_url
 from forma_cli.credentials import CredentialStore, SESSION_KEY
+from forma_core._version import __version__
+from forma_core.config.compatibility import (
+    CURRENT_PROTOCOL_VERSION,
+    CompatibilityMetadata,
+    CompatibilityResult,
+    CompatibilityStatus,
+    ensure_supported_hardware_ir_version,
+    evaluate_compatibility,
+    unavailable_result,
+)
 
 
 class FormaAPIError(RuntimeError):
@@ -64,8 +74,13 @@ class CloudProjectSummary(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     project_id: str
+    owner_user_id: str | None = None
     workspace_id: str | None = None
+    creation_channel: str = "cli"
     title: str = ""
+    prompt: str = ""
+    visibility: str = "public"
+    status: str = "active"
     revision_id: str | None = None
     revision: int | None = None
     parent_revision_id: str | None = None
@@ -82,6 +97,38 @@ class CloudProjectRevision(BaseModel):
     parent_revision_id: str | None = None
     manifest: dict[str, Any]
     created_at: str | None = None
+
+
+class DeliveryProjectRef(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    project_id: str
+    revision_id: str
+    revision: int
+    parent_revision_id: str | None = None
+    visibility: str = "private"
+
+
+class DeliveryArtifactStatus(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    path: str | None = None
+    sha256: str | None = None
+    media_type: str | None = None
+    size_bytes: int | None = None
+    status: str = "pending"
+
+
+class DeliveryReceipt(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    delivery_id: str
+    status: str
+    project: DeliveryProjectRef
+    artifacts: list[DeliveryArtifactStatus] = field(default_factory=list)
+    artifact_summary: dict[str, int] = {}
+    created_at: str | None = None
+    completed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +160,8 @@ class FormaAPIClient:
     base_url: str | None = None
     credential_store: CredentialStore | None = None
     timeout_seconds: float = 30.0
+    _compatibility_result: CompatibilityResult | None = field(default=None, init=False, repr=False)
+    _compatibility_notice_emitted: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.base_url = (self.base_url or api_url()).rstrip("/")
@@ -131,6 +180,44 @@ class FormaAPIClient:
         self._store.set_json(SESSION_KEY, tokens.model_dump(mode="json"))
         return tokens
 
+    @staticmethod
+    def _is_local_endpoint(base_url: str) -> bool:
+        host = (urlparse(base_url).hostname or "").lower()
+        return host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost")
+
+    def check_compatibility(self, *, force: bool = False) -> CompatibilityResult:
+        """Fetch and cache hosted compatibility metadata for this client."""
+        if self._compatibility_result is not None and not force:
+            return self._compatibility_result
+        if self._is_local_endpoint(self.base_url or ""):
+            result = unavailable_result(__version__)
+        else:
+            try:
+                raw, _headers = self._request_wire(
+                    "/forma/version",
+                    authenticated=False,
+                    retry_refresh=False,
+                    _skip_compatibility=True,
+                )
+                metadata = CompatibilityMetadata.model_validate(self._decode_json(raw))
+                result = evaluate_compatibility(
+                    __version__,
+                    metadata,
+                    client_protocol_version=CURRENT_PROTOCOL_VERSION,
+                )
+            except (FormaAPIError, ValueError):
+                result = unavailable_result(__version__)
+        self._compatibility_result = result
+        return result
+
+    def compatibility_notice(self) -> str | None:
+        """Return the update notice once per client instance."""
+        result = self.check_compatibility()
+        if result.status != CompatibilityStatus.UPDATE_AVAILABLE or self._compatibility_notice_emitted:
+            return None
+        self._compatibility_notice_emitted = True
+        return f"WARNING: {result.message}"
+
     def _request_wire(
         self,
         path: str,
@@ -142,12 +229,19 @@ class FormaAPIClient:
         accept: str = "application/json",
         authenticated: bool = False,
         retry_refresh: bool = True,
+        _skip_compatibility: bool = False,
     ) -> tuple[bytes, dict[str, str]]:
         if payload is not None and body is not None:
             raise ValueError("A Forma API request cannot contain both JSON and binary payloads.")
+        if not _skip_compatibility:
+            result = self.check_compatibility()
+            if result.is_blocking:
+                raise FormaAPIError(result.message, status_code=426, detail=result.model_dump(mode="json"))
         headers = {
             "Accept": accept,
-            "User-Agent": "forma-oss-cli/0.1",
+            "User-Agent": f"forma-oss-cli/{__version__}",
+            "X-Forma-Client-Version": __version__,
+            "X-Forma-Protocol-Version": str(CURRENT_PROTOCOL_VERSION),
         }
         tokens = self._saved_tokens() if authenticated else None
         if authenticated:
@@ -167,8 +261,22 @@ class FormaAPIClient:
                 }
         except HTTPError as exc:
             raw = exc.read()
-            detail = self._decode_json(raw)
-            if exc.code == 401 and authenticated and retry_refresh and tokens and tokens.refresh_token:
+
+            try:
+                detail = self._decode_json(raw)
+            except FormaAPIError:
+                detail = {
+                    "raw_body": raw.decode("utf-8", errors="replace").strip() or None,
+                    "content_type": exc.headers.get("Content-Type"),
+                }
+
+            if (
+                exc.code == 401
+                and authenticated
+                and retry_refresh
+                and tokens
+                and tokens.refresh_token
+            ):
                 try:
                     self.refresh(tokens.refresh_token)
                 except FormaAPIError:
@@ -183,9 +291,14 @@ class FormaAPIClient:
                         accept=accept,
                         authenticated=authenticated,
                         retry_refresh=False,
+                        _skip_compatibility=_skip_compatibility,
                     )
+
             raise FormaAPIError(
-                self._error_message(detail, fallback=f"Forma API request failed ({exc.code})."),
+                self._error_message(
+                    detail,
+                    fallback=f"Forma API request failed ({exc.code}).",
+                ),
                 status_code=exc.code,
                 detail=detail,
             ) from exc
@@ -255,7 +368,8 @@ class FormaAPIClient:
     @staticmethod
     def _error_message(detail: Any, *, fallback: str) -> str:
         if isinstance(detail, dict):
-            message = detail.get("message") or detail.get("detail")
+            nested = detail.get("detail") if isinstance(detail.get("detail"), dict) else detail
+            message = nested.get("message") or nested.get("detail")
             if isinstance(message, str) and message.strip():
                 return message.strip()
         if isinstance(detail, str) and detail.strip():
@@ -316,14 +430,24 @@ class FormaAPIClient:
         manifest: Mapping[str, Any],
         *,
         parent_revision_id: str | None = None,
-    ) -> CloudProjectRevision:
+        idempotency_key: str | None = None,
+        visibility: str | None = None,
+    ) -> DeliveryReceipt:
+        ensure_supported_hardware_ir_version(manifest)
+        body: dict[str, Any] = {"manifest": dict(manifest)}
+        if parent_revision_id is not None:
+            body["parent_revision_id"] = parent_revision_id
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        if visibility is not None:
+            body["visibility"] = visibility
         payload = self._request(
             "/cli/projects/push",
             method="POST",
-            payload={"manifest": dict(manifest), "parent_revision_id": parent_revision_id},
+            payload=body,
             authenticated=True,
         )
-        return CloudProjectRevision.model_validate(payload)
+        return DeliveryReceipt.model_validate(payload)
 
     def upload_project_artifact(
         self,
@@ -366,6 +490,49 @@ class FormaAPIClient:
         payload = self._request(path, authenticated=True)
         return CloudProjectRevision.model_validate(payload)
 
+    def deliver_project(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        idempotency_key: str,
+        parent_revision_id: str | None = None,
+        visibility: str | None = None,
+    ) -> DeliveryReceipt:
+        ensure_supported_hardware_ir_version(manifest)
+        body: dict[str, Any] = {
+            "manifest": dict(manifest),
+            "idempotency_key": idempotency_key,
+        }
+        if parent_revision_id is not None:
+            body["parent_revision_id"] = parent_revision_id
+        if visibility is not None:
+            body["visibility"] = visibility
+        payload = self._request(
+            "/cli/projects/deliver",
+            method="POST",
+            payload=body,
+            authenticated=True,
+        )
+        return DeliveryReceipt.model_validate(payload)
+
+    def complete_delivery(self, delivery_id: str) -> DeliveryReceipt:
+        payload = self._request(
+            f"/cli/projects/deliver/{quote(delivery_id, safe='')}/complete",
+            method="POST",
+            payload={},
+            authenticated=True,
+        )
+        return DeliveryReceipt.model_validate(payload)
+
+    def publish_project(self, project_id: str) -> dict[str, Any]:
+        payload = self._request(
+            f"/cli/projects/{quote(project_id, safe='')}/publish",
+            method="POST",
+            payload={},
+            authenticated=True,
+        )
+        return payload if isinstance(payload, dict) else {}
+
     def list_keys(self) -> list[ManagedCredentialMetadata]:
         payload = self._request("/cli/credentials", authenticated=True)
         items = payload.get("items", payload) if isinstance(payload, dict) else payload
@@ -388,6 +555,12 @@ __all__ = [
     "AccountIdentity",
     "CloudProjectRevision",
     "CloudProjectSummary",
+    "CompatibilityMetadata",
+    "CompatibilityResult",
+    "CompatibilityStatus",
+    "DeliveryArtifactStatus",
+    "DeliveryProjectRef",
+    "DeliveryReceipt",
     "DeviceAuthorization",
     "DevicePollResult",
     "FormaAPIClient",

@@ -1,15 +1,59 @@
-# OpenClaw, NemoClaw, and OpenCode
+# Agent clients
 
 Forma supports these clients through two portable surfaces:
 
 - A shared Agent Skill at `.agents/skills/forma-hardware/SKILL.md`.
 - An MCP Streamable HTTP endpoint at `http://127.0.0.1:8000/mcp` (or `/api/mcp` when the deployment adds an `/api` prefix).
 
+For Cursor packaging, local installation, protected cloud authentication, and
+Grok Bot's CLI/MCP options, see [Install Forma for Cursor / Grok Bot](cursor-plugin.md).
+
+## Cloud and local worker boundary
+
+Cloud Forma remains the public browser API, chat/persistence authority, and project
+viewer. A Mini-PC may run the same backend code as a local execution worker for
+OpenCode-owned conversations, compilation, deterministic validation, and generation
+when explicitly configured. The worker delivers accepted snapshots and revisions
+back to cloud Forma through authenticated outbound HTTPS/CLI delivery.
+
+The local worker is not a second hosted Forma deployment. Do not point the Vercel
+browser API at it, copy production Supabase/Clerk/Redis state to it, or publish its
+loopback MCP/API port through a tunnel for normal operation. A narrowly scoped
+remote worker-control endpoint would require separate security review.
+
 Start the backend in local authentication mode:
 
 ```bash
 FORMA_AUTH_MODE=local uvicorn apps.api.main:app --port 8000
 ```
+
+## Restricted OpenCode authoring results
+
+The session-scoped `/opencode/mcp` tools publish the actual HardwareIntermediateRepresentation input
+schema, with references resolved from `$defs` at the tool schema root. Invalid
+HardwareIntermediateRepresentation returns an MCP tool result with `isError: true` and structured code
+`hardware_ir_invalid` after capability authorization. Each diagnostic contains
+only a field `path` and error `type`, not input values or validator messages.
+For example, a missing pin type reports
+`["project_ir", "part_definitions", 0, "pins", 0, "pin_type"]` and `missing`.
+Correct these fields using the schema before retrying. Arbitrary mapping keys
+are redacted as `<key>`.
+
+Command `succeeded`/event `completed` describes execution, not design production.
+The gateway verifies the latest owner-scoped saved revision and supplies its
+revision ID, current deterministic validation, durable artifact IDs, and typed
+`design_outcome`. Connector-supplied output claims do not override this evidence.
+No saved revision means null revision/validation/outcome and no artifact IDs.
+
+- `draft`: no components or nets, even if text requirements exist and validation passes.
+- `partial`: populated but incomplete or critically invalid; `is_valid` and issue counts distinguish invalidity.
+- `complete`: components, pins, and nets exist, deterministic checks have no critical findings, and generation metadata does not mark the result incomplete.
+
+This is conservative electrical-design readiness, not proof of physical safety,
+full requirement coverage, finished mechanical-only output, assembly instructions,
+or CAD availability. Artifacts are reported separately. The browser preserves
+agent text and labels draft-only, incomplete, or unverified output rather than
+treating a successful project GET as a completed design.
 
 ## OpenClaw
 
@@ -53,7 +97,7 @@ installing the skill, before asking an agent to create or export CAD:
 python .agents/skills/forma-hardware/scripts/cad.py setup
 ```
 
-The adapter pins OpenCAD `0.2.3` with the `occt` extra, reuses a compatible
+The adapter pins OpenCAD `0.2.4` with the `occt` extra, reuses a compatible
 native installation, and verifies OCCT before a model runs. See the skill's
 [CAD reference](../.agents/skills/forma-hardware/references/cad.md) for build
 commands, exact recovery diagnostics, and `FORMA_OPENCAD_REQUIREMENT` source
@@ -92,7 +136,7 @@ Verify it with:
 opencode mcp list
 ```
 
-## Protected deployments
+## Protected cloud deployments
 
 The MCP route accepts either a Clerk administrator session or the dedicated `FORMA_MCP_API_KEY`. The API key must contain at least 32 characters. Pass the selected credential as an `Authorization: Bearer ...` header and keep it in an environment variable rather than committing it.
 
@@ -108,7 +152,7 @@ OpenClaw can set the equivalent header with `openclaw mcp add --header` or in it
 
 ## Host-authored compilation
 
-`forma.compile_project` is the preferred agent workflow. The calling agent authors Hardware IR, then Forma normalizes it, runs deterministic validation, and returns the compiled IR, validation summary, Mermaid wiring graph, and SVG schematic. This path does not invoke Forma's configured server-side LLM.
+`forma.compile_project` is the preferred agent workflow. The calling agent authors Hardware Intermediate Representation, then Forma normalizes it, runs deterministic validation, and returns the compiled Intermediate Representation, validation summary, Mermaid wiring graph, and SVG schematic. This path does not invoke Forma's configured server-side LLM.
 
 `forma.generate_project` remains available when server-side generation is explicitly wanted.
 

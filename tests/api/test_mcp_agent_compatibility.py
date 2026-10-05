@@ -9,9 +9,11 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from apps.api import a2a
-from apps.api.a2a import A2AMessage, MCP_DEFAULT_PROTOCOL_VERSION, handle_mcp_json_rpc
+from apps.api.a2a import A2AMessage, MCP_DEFAULT_PROTOCOL_VERSION, _persist_mcp_compile, handle_mcp_json_rpc
 from apps.api.auth import UserContext
 from apps.api.main import app
+from forma_core.workspaces.projects import ProjectStateError
+from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 
 
 class McpAgentCompatibilityTests(unittest.IsolatedAsyncioTestCase):
@@ -107,8 +109,8 @@ class McpAgentCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nemoclaw", authoring_agents)
 
     async def test_compile_project_persists_public_project_and_returns_identity(self) -> None:
-        with patch("apps.api.a2a.get_generated_project", return_value=None), patch(
-            "apps.api.a2a.save_generated_project"
+        with patch("apps.api.a2a.get_project_identity", return_value=None), patch(
+            "apps.api.a2a.persist_legacy_project_projection"
         ) as save_project:
             response = await handle_mcp_json_rpc(
                 {
@@ -142,9 +144,9 @@ class McpAgentCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             is_authenticated=True,
             is_admin=False,
         )
-        with patch("apps.api.a2a.get_generated_project", return_value=None), patch(
-            "apps.api.a2a.save_generated_project"
-        ) as save_project:
+        with patch("apps.api.a2a.get_project_identity", return_value=None), patch(
+            "apps.api.a2a.persist_chat_project_revision"
+        ) as persist_revision:
             response = await handle_mcp_json_rpc(
                 {
                     "jsonrpc": "2.0",
@@ -165,13 +167,69 @@ class McpAgentCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         compiled = response["result"]["structuredContent"]
         self.assertEqual("private", compiled["visibility"])
         self.assertIsNotNone(compiled["chat_id"])
-        self.assertEqual("agent-user", save_project.call_args.kwargs["owner_user_id"])
-        self.assertEqual("Build a private sensor enclosure", save_project.call_args.kwargs["prompt"])
+        self.assertEqual("agent-user", persist_revision.call_args.args[1])
+        self.assertEqual("Build a private sensor enclosure", persist_revision.call_args.kwargs["prompt"])
+        self.assertEqual("private", persist_revision.call_args.kwargs["visibility"])
+
+    def test_compile_recovers_a_partial_identity_without_a_revision(self) -> None:
+        project_id = "12345678-1234-4234-8234-123456789012"
+        project = HardwareIntermediateRepresentation.model_validate({"components": [], "nets": []})
+        with (
+            patch(
+                "apps.api.a2a.get_project_identity",
+                return_value={
+                    "owner_user_id": "agent-user",
+                    "status": "active",
+                    "chat_id": "chat-1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "visibility": "public",
+                },
+            ),
+            patch(
+                "apps.api.a2a.get_latest_project_revision",
+                side_effect=ProjectStateError("project_revision_not_found", "missing"),
+            ),
+            patch("apps.api.a2a.persist_chat_project_revision") as persist_revision,
+        ):
+            result = _persist_mcp_compile(
+                project,
+                {
+                    "project_id": project_id,
+                    "prompt": "OpenCode project",
+                    "visibility": "private",
+                    "authoring_agent": "opencode",
+                },
+                self._user(),
+            )
+
+        self.assertEqual(project_id, result["project_id"])
+        self.assertEqual("private", result["visibility"])
+        persist_revision.assert_called_once()
+
+    def test_opencode_revisions_preserve_the_original_brief_and_chat(self) -> None:
+        project_id = "12345678-1234-4234-8234-123456789012"
+        original = "A nylon mechanical gear with 36 rounded teeth, no electronics."
+        prior = HardwareIntermediateRepresentation.model_validate({"components": [], "nets": [], "assembly_metadata": {"source_prompt": original}})
+        project = HardwareIntermediateRepresentation.model_validate({"components": [], "nets": [], "assembly_metadata": {"source_prompt": "Render this project"}})
+        with (
+            patch("apps.api.a2a.get_project_identity", return_value={
+                "owner_user_id": "agent-user", "status": "active", "chat_id": "original-chat",
+                "created_at": "2026-01-01T00:00:00Z", "visibility": "private", "prompt": original,
+            }),
+            patch("apps.api.a2a.get_latest_project_revision", return_value=SimpleNamespace(state=prior)),
+            patch("apps.api.a2a.persist_chat_project_revision") as persist,
+        ):
+            result = _persist_mcp_compile(project, {
+                "project_id": project_id, "authoring_agent": "opencode", "prompt": "OpenCode project",
+            }, self._user())
+        self.assertEqual(original, persist.call_args.kwargs["prompt"])
+        self.assertEqual(original, project.assembly_metadata["source_prompt"])
+        self.assertEqual("original-chat", result["chat_id"])
 
     async def test_compile_project_persists_and_validates(self) -> None:
-        with patch("apps.api.a2a.get_generated_project", return_value=None), patch(
-            "apps.api.a2a.save_generated_project"
-        ):
+        with patch("apps.api.a2a.get_project_identity", return_value=None), patch(
+            "apps.api.a2a.persist_legacy_project_projection"
+        ), patch("apps.api.a2a.persist_chat_project_revision"):
             response = await handle_mcp_json_rpc(
                 {
                     "jsonrpc": "2.0",
@@ -196,16 +254,15 @@ class McpAgentCompatibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_compile_project_cannot_update_another_owner(self) -> None:
         project_id = "12345678-1234-4234-8234-123456789012"
         with patch(
-            "apps.api.a2a.get_generated_project",
-            return_value=SimpleNamespace(
-                owner_user_id="different-user",
-                status="active",
-                hardware_ir={},
-                chat_id=None,
-                created_at="2026-01-01T00:00:00Z",
-                visibility="private",
-            ),
-        ), patch("apps.api.a2a.update_generated_project_hardware_ir") as update_project:
+            "apps.api.a2a.get_project_identity",
+            return_value={
+                "owner_user_id": "different-user",
+                "status": "active",
+                "chat_id": None,
+                "created_at": "2026-01-01T00:00:00Z",
+                "visibility": "private",
+            },
+        ), patch("apps.api.a2a.refresh_legacy_project_projection") as update_project:
             response = await handle_mcp_json_rpc(
                 {
                     "jsonrpc": "2.0",

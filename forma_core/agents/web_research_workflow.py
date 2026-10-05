@@ -4,8 +4,9 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 from forma_core.external_sources import ExternalSourceLibrary, build_external_source_provider
 from forma_core.agents.orchestrator import (
@@ -21,7 +22,7 @@ from forma_core.agents.system_architecture import (
     compact_net_context,
     system_context,
 )
-from forma_core.database import delete_generated_project, save_generated_project
+from forma_core.database import persist_chat_project_revision, persist_legacy_project_projection, update_project_deletion_state
 from forma_core.jobs.source_usage import source_usage_for_workflow
 from forma_core.llm import (
     LLMProviderConfigError,
@@ -36,7 +37,7 @@ from forma_core.workspaces.projects.models import (
     ComponentInstance,
     ConnectionNet,
     FunctionalRequirements,
-    HardwareIR,
+    HardwareIntermediateRepresentation,
     MechanicalNotes,
     PinMappingEntry,
     ProjectOverview,
@@ -61,6 +62,7 @@ from forma_core.runtime import (
     deployment_mode_enabled,
     generation_unavailable_message,
 )
+from forma_core.user_integrations import ResolvedIntegrationSettings
 from forma_core.validation import (
     build_validation_summary,
     check_safety_violations,
@@ -92,6 +94,11 @@ class WebComponentSelection(BaseModel):
     components: List[ComponentInstance]
     sourcing_notes: List[str] = Field(default_factory=list)
     rejected_options: List[str] = Field(default_factory=list)
+
+    @field_serializer("components")
+    def serialize_components(self, components: List[ComponentInstance]) -> list[dict[str, object]]:
+        # Stage snapshots have no shared part_definitions to hydrate from.
+        return [component_detail_payload(component) for component in components]
 
 
 class WiringWrapper(BaseModel):
@@ -140,7 +147,7 @@ WEB_GENERATION_STAGE_SPECS = [
 
 
 class WebResearchHardwarePipeline:
-    """Internet-researched hardware workflow that keeps the same HardwareIR output contract."""
+    """Internet-researched hardware workflow that keeps the same HardwareIntermediateRepresentation output contract."""
 
     workflow_id = "web_research"
 
@@ -149,19 +156,22 @@ class WebResearchHardwarePipeline:
         provider_name: Optional[str] = None,
         model_name: Optional[str] = None,
         runtime_config: Optional[LLMRuntimeConfig] = None,
+        settings: Optional[ResolvedIntegrationSettings] = None,
         external_source_provider: Optional[str] = None,
         persist_project: bool = True,
     ):
+        self.settings = settings
         self.runtime_config = runtime_config or resolve_llm_runtime_config(
             provider_name=provider_name,
             model_name=model_name,
+            settings=settings,
         )
-        self.llm_provider = build_llm_provider(runtime_config=self.runtime_config)
+        self.llm_provider = build_llm_provider(runtime_config=self.runtime_config, settings=settings)
         self.use_simulation = not self.llm_provider.is_configured
         self.model_name = self.llm_provider.model_name
         self.external_source_provider = external_source_provider
         self.persist_project = persist_project
-        self.research_client = build_external_source_provider(provider=external_source_provider)
+        self.research_client = build_external_source_provider(provider=external_source_provider, settings=settings)
         self._active_generation_metadata: Dict[str, Any] = {}
 
     def get_debug_config(self) -> Dict[str, Any]:
@@ -268,7 +278,7 @@ class WebResearchHardwarePipeline:
         image_bytes: Optional[bytes] = None,
         image_mime_type: Optional[str] = None,
         generation_metadata: Optional[Dict[str, Any]] = None,
-    ) -> HardwareIR:
+    ) -> HardwareIntermediateRepresentation:
         self.validate_configured_model()
         self._active_generation_metadata = {
             key: value
@@ -285,7 +295,7 @@ class WebResearchHardwarePipeline:
         if safety_error:
             emit_agent_pipeline_event(self.workflow_id, "safety_guardrail", "failed", details={"reason": safety_error})
             logger.info("Web research workflow safety guardrail blocked request; delegating to safety response.")
-            return HardwarePipelineOrchestrator(runtime_config=self.runtime_config).generate_project(
+            return HardwarePipelineOrchestrator(runtime_config=self.runtime_config, settings=self.settings).generate_project(
                 user_prompt,
                 image_bytes=image_bytes,
                 image_mime_type=image_mime_type,
@@ -297,7 +307,7 @@ class WebResearchHardwarePipeline:
                 raise AlphaGenerationUnavailableError(generation_unavailable_message(self.get_debug_config()))
             logger.info("Web research workflow is using simulation fallback because external generation is unavailable.")
             emit_agent_pipeline_event(self.workflow_id, "external_research", "skipped", details={"reason": self.research_client.config.reason})
-            ir = HardwarePipelineOrchestrator(use_simulation=True, runtime_config=self.runtime_config).generate_project(
+            ir = HardwarePipelineOrchestrator(use_simulation=True, runtime_config=self.runtime_config, settings=self.settings).generate_project(
                 user_prompt,
                 image_bytes=image_bytes,
                 image_mime_type=image_mime_type,
@@ -425,7 +435,7 @@ class WebResearchHardwarePipeline:
 
         logger.info("Packaging web research project artifacts...")
         with agent_pipeline_step(self.workflow_id, "package_project"):
-            project_ir = HardwareIR(
+            project_ir = HardwareIntermediateRepresentation(
                 hardware_ir_version="0.1",
                 overview=plan.overview,
                 requirements=plan.requirements,
@@ -490,7 +500,7 @@ class WebResearchHardwarePipeline:
         image_bytes: Optional[bytes],
         image_mime_type: Optional[str],
         model_validation: LLMProviderValidation,
-    ) -> HardwareIR:
+    ) -> HardwareIntermediateRepresentation:
         """Run artifact-producing stages independently and checkpoint each result."""
 
         metadata = self._active_generation_metadata
@@ -647,7 +657,7 @@ class WebResearchHardwarePipeline:
 
     def _generate_cad_stage(
         self,
-        project: HardwareIR,
+        project: HardwareIntermediateRepresentation,
         metadata: Dict[str, Any],
     ) -> Dict[str, Any]:
         ensure_native_cad_model(
@@ -671,7 +681,7 @@ class WebResearchHardwarePipeline:
         *,
         user_prompt: str,
         model_validation: LLMProviderValidation,
-    ) -> HardwareIR:
+    ) -> HardwareIntermediateRepresentation:
         plan = stage_run.output("web_architect", WebProjectPlan)
         selection = stage_run.output("web_component_sourcing", WebComponentSelection)
         components = expand_component_instances(selection.components) if selection is not None else []
@@ -724,7 +734,7 @@ class WebResearchHardwarePipeline:
             for record in stage_run.records.values()
             if record.status.value in {"failed", "blocked"}
         ]
-        project_ir = HardwareIR(
+        project_ir = HardwareIntermediateRepresentation(
             overview=plan.overview if plan is not None else None,
             requirements=plan.requirements if plan is not None else None,
             system_architecture=plan.system_architecture if plan is not None else None,
@@ -1019,6 +1029,7 @@ class WebResearchHardwarePipeline:
         {research_context}
 
         Populate physical_form with the requested overall shape, silhouette, and form factor. Treat explicit human shape context as authoritative and do not default to a rectangular project box. If the project is exposed, structural, or open-frame, do not invent a closed case.
+        For a requested two-gear motion example, use mechanism_benchmark with kind spur_gear_pair. Set driver_teeth and driven_teeth (defaults 20/40), module_mm (default 2), face_width_mm (default 8), and cycle_seconds (default 6) to match the request. OpenCAD generates separate gear bodies and coupled motion; do not substitute boxes or independent motion_intents.
         Use CAD/enclosure URLs only when present in research or well-known source data. If no source exists, keep cad_sources empty.
         Return MechanicalNotes.
         """
@@ -1161,7 +1172,7 @@ class WebResearchHardwarePipeline:
             )
         return issues
 
-    def _save_project_to_db(self, prompt: str, ir: HardwareIR) -> str:
+    def _save_project_to_db(self, prompt: str, ir: HardwareIntermediateRepresentation) -> str:
         ensure_agent_pipeline_active()
         project_id = canonical_project_uuid((ir.assembly_metadata or {}).get("project_id"))
         generation_metadata = self._active_generation_metadata or {}
@@ -1178,22 +1189,42 @@ class WebResearchHardwarePipeline:
         if not self.persist_project:
             return project_id
         try:
-            save_generated_project(
-                project_id=project_id,
-                title=ir.overview.title if ir.overview else "Untitled Forma Project",
-                prompt=str(generation_metadata.get("project_prompt") or prompt),
-                hardware_ir=ir.model_dump(),
-                created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                chat_id=generation_metadata.get("chat_id"),
-                owner_user_id=generation_metadata.get("owner_user_id"),
-                visibility="public",
-            )
+            owner_user_id = generation_metadata.get("owner_user_id")
+            if owner_user_id:
+                persist_chat_project_revision(
+                    project_id,
+                    owner_user_id,
+                    ir,
+                    source_job_id=str(generation_metadata.get("frontend_job_id") or f"web-research-{uuid4().hex}"),
+                    prompt=str(generation_metadata.get("project_prompt") or prompt),
+                    chat_id=generation_metadata.get("chat_id"),
+                )
+            else:
+                persist_legacy_project_projection(
+                    project_id=project_id,
+                    title=ir.overview.title if ir.overview else "Untitled Forma Project",
+                    prompt=str(generation_metadata.get("project_prompt") or prompt),
+                    hardware_ir=ir.model_dump(),
+                    created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    chat_id=generation_metadata.get("chat_id"),
+                    owner_user_id=None,
+                    visibility="public",
+                )
             try:
                 ensure_agent_pipeline_active()
             except PipelineCancelledError:
                 owner_user_id = generation_metadata.get("owner_user_id")
                 if owner_user_id:
-                    delete_generated_project(project_id, owner_user_id)
+                    update_project_deletion_state(
+                        project_id,
+                        owner_user_id=owner_user_id,
+                        allowed_statuses=["active"],
+                        updates={
+                            "status": "deletion_pending",
+                            "deleted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "deletion_requested_by": owner_user_id,
+                        },
+                    )
                 raise
             logger.info("Web research workflow project saved to database with ID: %s", project_id)
             return project_id

@@ -4,20 +4,37 @@ from typing import Tuple
 
 from forma_core.jobs.schema import JOB_TABLE_CONTRACT
 from forma_core.persistence.base import TableContract
+from forma_core.opencode.schema import OPENCODE_TABLE_CONTRACTS
 
 # This is the schema surface used through both the local SQLite provider and
 # the hosted Supabase provider. A Supabase startup projection checks columns as
 # well as table visibility, so schema drift fails at startup rather than during
 # an unrelated request.
 APPLICATION_SCHEMA: Tuple[TableContract, ...] = (
+    TableContract("component_asset_versions", ("asset_id", "version", "scope_key", "identity_key", "family_key", "payload_json", "created_at")),
     TableContract(
         "component_templates",
         ("id", "part_number", "name", "category", "description", "price", "sourcing_url", "pins", "use_cases"),
     ),
     TableContract(
+        "projects",
+        (
+            "project_id", "owner_user_id", "creation_channel", "title", "prompt", "chat_id", "workspace_id",
+            "visibility", "status", "created_at", "updated_at",
+        ),
+    ),
+    TableContract(
+        "project_gallery_inventory",
+        (
+            "project_id", "owner_user_id", "creation_channel", "title", "prompt", "chat_id", "workspace_id",
+            "visibility", "status", "created_at", "updated_at", "source", "revision_id", "revision",
+            "revision_payload_json", "revision_created_at", "legacy_hardware_ir", "legacy_id",
+        ),
+    ),
+    TableContract(
         "generated_projects",
         (
-            "id", "project_id", "chat_id", "owner_user_id", "visibility", "title", "prompt", "hardware_ir", "created_at",
+            "id", "project_id", "chat_id", "owner_user_id", "creation_channel", "visibility", "title", "prompt", "hardware_ir", "created_at",
             "status", "deleted_at", "deletion_requested_by", "purge_after", "purge_started_at", "purge_completed_at",
             "deletion_error",
         ),
@@ -65,8 +82,8 @@ APPLICATION_SCHEMA: Tuple[TableContract, ...] = (
     TableContract(
         "cli_projects",
         (
-            "project_id", "workspace_id", "owner_user_id", "title", "current_revision",
-            "current_revision_id", "created_at", "updated_at",
+            "project_id", "workspace_id", "owner_user_id", "creation_channel", "title",
+            "current_revision", "current_revision_id", "visibility", "created_at", "updated_at",
         ),
     ),
     TableContract(
@@ -116,10 +133,22 @@ APPLICATION_SCHEMA: Tuple[TableContract, ...] = (
         ("id", "project_id", "acting_user_id", "action", "status", "policy_version", "details_json", "created_at"),
     ),
     TableContract(
+        "project_publish_audit",
+        ("id", "project_id", "owner_user_id", "acting_user_id", "visibility_before", "created_at"),
+    ),
+    TableContract(
+        "cli_project_deliveries",
+        (
+            "delivery_id", "project_id", "owner_user_id", "idempotency_key", "revision_id", "revision",
+            "parent_revision_id", "manifest_json", "status", "receipt_json", "created_at", "completed_at",
+        ),
+    ),
+    TableContract(
         "project_chats",
         ("id", "chat_id", "owner_user_id", "title", "messages", "created_at", "updated_at"),
     ),
     JOB_TABLE_CONTRACT,
+    *OPENCODE_TABLE_CONTRACTS,
     TableContract(
         "alpha_signups",
         ("id", "name", "email", "organization", "additional_info", "source", "metadata_json", "created_at"),

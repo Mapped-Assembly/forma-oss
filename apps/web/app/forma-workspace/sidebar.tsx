@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
 import {
+  AlertTriangle,
+  Clock3,
+  Info,
   Database,
   Handshake,
   History,
@@ -23,8 +26,12 @@ import {
 } from "lucide-react";
 
 import CaidLogo from "../../components/caid-logo";
+import type { ChatActivity } from "../../lib/chat-activity";
 import { FormaUserButton, useFormaAuth } from "../../lib/forma-auth";
-import { type WorkspaceStatusPresentation } from "../../lib/connection-status";
+import {
+  type WorkspaceStatusPresentation,
+  type WorkspaceStatusTone,
+} from "../../lib/connection-status";
 
 export type ChatListItem = {
   chatId: string;
@@ -111,10 +118,17 @@ function formatSidebarDate(value: string | null) {
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+const STATUS_BADGE_TONE_CLASS: Record<WorkspaceStatusTone, string> = {
+  ok: "status-badge-ok",
+  authoring: "status-badge-authoring",
+  delivered: "status-badge-delivered",
+  error: "status-badge-error",
+};
+
 function ApiConnectionStatus({ status }: { status: WorkspaceStatusPresentation }) {
   return (
     <span
-      className={`status-badge ${status.tone === "error" ? "status-badge-error" : "status-badge-ok"} ${
+      className={`status-badge ${STATUS_BADGE_TONE_CLASS[status.tone]} ${
         status.pulse ? "status-badge-pulse" : "status-badge-idle"
       }`}
       role="status"
@@ -217,6 +231,7 @@ export function MobileSidebarDrawer({
   onPinChat,
   onDeleteChat,
   waitingChatIds,
+  chatActivityById = {},
   chatsLoading,
   showJobs,
   jobsPending,
@@ -239,6 +254,7 @@ export function MobileSidebarDrawer({
   onPinChat?: (item: ChatListItem) => void;
   onDeleteChat?: (item: ChatListItem) => void;
   waitingChatIds: Set<string>;
+  chatActivityById?: Record<string, ChatActivity>;
   chatsLoading?: boolean;
   showJobs: boolean;
   jobsPending?: boolean;
@@ -274,6 +290,7 @@ export function MobileSidebarDrawer({
           onPinChat={onPinChat}
           onDeleteChat={onDeleteChat}
           waitingChatIds={waitingChatIds}
+          chatActivityById={chatActivityById}
           chatsLoading={chatsLoading}
           showJobs={showJobs}
           jobsPending={jobsPending}
@@ -285,11 +302,31 @@ export function MobileSidebarDrawer({
   );
 }
 
+function ChatActivityIndicator({ activity, waiting, active, compact }: {
+  activity?: ChatActivity;
+  waiting: boolean;
+  active: boolean;
+  compact: boolean;
+}) {
+  const state = activity?.state || (waiting ? "running" : "settled");
+  if (state === "settled") return null;
+  const Icon = state === "running" || state === "reconnecting" ? RefreshCw
+    : state === "queued" ? Clock3 : state === "checking" ? Info : AlertTriangle;
+  return (
+    <span role="status" aria-label={activity?.label || "Request in progress."} title={activity?.label || "Request in progress."}>
+      <Icon className={`${compact ? "h-4 w-4" : "h-3.5 w-3.5"} shrink-0 ${state === "running" ? "animate-spin" : ""} ${
+        state === "interrupted" || state === "reconnecting" ? "text-amber-500" : active ? "text-emerald-400" : "text-zinc-500"
+      }`} aria-hidden="true" />
+    </span>
+  );
+}
+
 function ChatSidebarRow({
   chat,
   compact,
   active,
   waiting,
+  activity,
   renaming,
   renameDraft,
   dateLabel,
@@ -310,6 +347,7 @@ function ChatSidebarRow({
   compact: boolean;
   active: boolean;
   waiting: boolean;
+  activity?: ChatActivity;
   renaming: boolean;
   renameDraft: string;
   dateLabel: string;
@@ -370,8 +408,8 @@ function ChatSidebarRow({
   }, [menuOpen, onCloseMenu]);
 
   const titleBlock = compact ? (
-    waiting ? (
-      <RefreshCw className={`h-4 w-4 animate-spin ${active ? "text-emerald-400" : "text-zinc-500"}`} />
+    (waiting || activity) ? (
+      <ChatActivityIndicator activity={activity} waiting={waiting} active={active} compact />
     ) : chat.pinned ? (
       <Pin className={`h-4 w-4 ${active ? "text-emerald-400" : "text-zinc-500"}`} />
     ) : (
@@ -406,19 +444,14 @@ function ChatSidebarRow({
               <Pin className={`h-3 w-3 shrink-0 ${active ? "text-emerald-400" : "text-zinc-500"}`} aria-hidden="true" />
             )}
             <div className="truncate">{chat.title}</div>
-            {readOnly && (
-              <span className="shrink-0 rounded border border-cyan-300/20 px-1 py-0.5 text-[9px] font-medium text-cyan-300">
-                Read-only
-              </span>
-            )}
           </div>
         )}
         {chat.projectCount > 1 && (
           <div className="mt-0.5 text-[10px] text-zinc-600">{chat.projectCount} projects</div>
         )}
       </div>
-      {waiting && (
-        <RefreshCw className={`h-3.5 w-3.5 shrink-0 animate-spin ${active ? "text-emerald-400" : "text-zinc-500"}`} />
+      {(waiting || activity) && (
+        <ChatActivityIndicator activity={activity} waiting={waiting} active={active} compact={false} />
       )}
       {dateLabel && <div className="shrink-0 text-[10px] text-zinc-600">{dateLabel}</div>}
     </>
@@ -440,8 +473,8 @@ function ChatSidebarRow({
           onStartRename();
         }}
         className={`flex min-w-0 flex-1 items-center gap-2.5 rounded-lg py-2 text-left ${compact ? "justify-center px-0" : "px-3"}`}
-        title={readOnly ? `${chat.title} (read-only during maintenance)` : waiting ? `${chat.title} is waiting` : canRename ? `${chat.title}. Double-click to rename.` : chat.title}
-        aria-label={`Open chat ${chat.title}${readOnly ? " (read-only)" : ""}${waiting ? " (waiting)" : ""}${chat.pinned ? ", pinned" : ""}`}
+        title={activity ? `${chat.title}: ${activity.label}` : waiting ? `${chat.title} is waiting` : canRename ? `${chat.title}. Double-click to rename.` : chat.title}
+        aria-label={`Open chat ${chat.title}${activity ? ` (${activity.label})` : waiting ? " (waiting)" : ""}${chat.pinned ? ", pinned" : ""}`}
       >
         {titleBlock}
       </button>
@@ -564,6 +597,7 @@ export function ChatSidebar({
   onPinChat,
   onDeleteChat,
   waitingChatIds,
+  chatActivityById = {},
   chatsLoading = false,
   showJobs,
   jobsPending = false,
@@ -587,6 +621,7 @@ export function ChatSidebar({
   onPinChat?: (item: ChatListItem) => void;
   onDeleteChat?: (item: ChatListItem) => void;
   waitingChatIds: Set<string>;
+  chatActivityById?: Record<string, ChatActivity>;
   chatsLoading?: boolean;
   showJobs: boolean;
   jobsPending?: boolean;
@@ -664,7 +699,7 @@ export function ChatSidebar({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
-          <SidebarSectionLabel compact={compact}>{readOnly ? "Chats (read-only)" : "Chats"}</SidebarSectionLabel>
+          <SidebarSectionLabel compact={compact}>Chats</SidebarSectionLabel>
           <div className="space-y-0.5">
             {chatsLoading ? (
               Array.from({ length: compact ? 5 : 7 }, (_, index) => (
@@ -691,6 +726,7 @@ export function ChatSidebar({
                   compact={compact}
                   active={chat.chatId === activeChatId}
                   waiting={waitingChatIds.has(chat.chatId)}
+                  activity={chatActivityById[chat.chatId]}
                   renaming={!readOnly && !compact && Boolean(onRenameChat) && renamingChatId === chat.chatId}
                   renameDraft={renameDraft}
                   dateLabel={formatSidebarDate(chat.createdAt)}

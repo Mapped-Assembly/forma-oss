@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -172,9 +173,15 @@ class ProjectArtifactStorage:
         if backend == "local":
             target = Path(self.config["directory"]) / Path(*key.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(f"{target.suffix}.tmp")
-            temporary.write_bytes(content)
-            temporary.replace(target)
+            # Each writer needs its own temporary file; identical concurrent puts
+            # previously raced over one .tmp path and could lose a successful write.
+            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(content)
+            try:
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
         elif backend == "supabase":
             bucket = self._supabase_bucket()
             options = {
@@ -227,6 +234,36 @@ class ProjectArtifactStorage:
                 raise ProjectArtifactStorageError("Project artifact storage download failed.") from exc
         self._validate_size(content)
         return StoredProjectArtifact(project_id, normalized_sha256, normalized_media_type, len(content), content)
+
+    def contains(self, project_id: str, sha256: str) -> bool:
+        """Return whether an object with the declared SHA-256 is already stored."""
+        self._require_enabled()
+        normalized_sha256 = str(sha256 or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_sha256):
+            raise ValueError("Project artifact storage requires a SHA-256 hash.")
+        key = project_artifact_storage_key(project_id, normalized_sha256)
+        backend = self.config["backend"]
+        if backend == "local":
+            return (Path(self.config["directory"]) / Path(*key.split("/"))).is_file()
+        if backend == "supabase":
+            bucket = self._supabase_bucket()
+            folder, _, name = key.rpartition("/")
+            try:
+                # Supabase storage treats a list prefix as a folder, so listing
+                # the full object key would only return its children. List the
+                # containing folder and match the object name instead.
+                items = bucket.list(folder, {"limit": 1000, "search": name}) or []
+            except Exception as exc:
+                raise ProjectArtifactStorageError("Project artifact presence check failed.") from exc
+            return any(
+                isinstance(item, dict) and item.get("name") == name
+                for item in items
+            )
+        try:
+            self._s3_client().head_object(Bucket=self.config["bucket"], Key=key)
+            return True
+        except Exception:
+            return False
 
     def delete_project(self, project_id: str) -> int:
         """Delete all objects for a project; used by privacy purge workers."""

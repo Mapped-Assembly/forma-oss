@@ -206,7 +206,7 @@ def import_project(
     assembly_step: str | Path | None = None,
     preview_stl: str | Path | None = None,
 ) -> ProjectManifest:
-    """Import a generated HardwareIR project and make its CAD renderable locally."""
+    """Import a generated Hardware Intermediate Representation project and make its CAD renderable locally."""
     source_path = Path(source).expanduser().resolve()
     if source_path.is_dir():
         source_path = source_path / PROJECT_FILENAME
@@ -215,12 +215,12 @@ def import_project(
 
     source_root = source_path.parent.resolve()
     imported = load_project_manifest(source_path)
-    from forma_core.workspaces.projects.models import HardwareIR
+    from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 
     try:
-        ir = HardwareIR.model_validate(imported.project_ir)
+        ir = HardwareIntermediateRepresentation.model_validate(imported.project_ir)
     except Exception as exc:
-        raise LocalProjectError(f"Project manifest contains invalid HardwareIR: {source_path}") from exc
+        raise LocalProjectError(f"Project manifest contains invalid HardwareIntermediateRepresentation: {source_path}") from exc
 
     target_root = Path(destination).expanduser().resolve() if destination else source_root
     target_root.mkdir(parents=True, exist_ok=True)
@@ -373,9 +373,9 @@ def status_project(path: str | Path | None = None) -> dict[str, Any]:
     manifest = read_project(root)
     try:
         from forma_core.validation import build_validation_summary, validate_circuit
-        from forma_core.workspaces.projects.models import HardwareIR
+        from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 
-        ir = HardwareIR.model_validate(manifest.project_ir)
+        ir = HardwareIntermediateRepresentation.model_validate(manifest.project_ir)
         summary = build_validation_summary(validate_circuit(ir.components, ir.nets, ir.requirements))
         valid = not summary.critical
         validation = summary.model_dump(mode="json")
@@ -396,6 +396,124 @@ def status_project(path: str | Path | None = None) -> dict[str, Any]:
     }
 
 
+def slice_local_project(
+    path: str | Path | None = None,
+    *,
+    printer_id: str | None = None,
+    backend: str | None = None,
+    profile: str | Path | None = None,
+    profile_name: str | None = None,
+    output_name: str | None = None,
+) -> ProjectManifest:
+    """Slice an existing local CAD mesh without regenerating the project."""
+    root = project_root(path)
+    manifest = read_project(root)
+    from forma_core.workspaces.projects.fabrication import (
+        SliceRequest,
+        load_printer_registry,
+        resolve_slice_profile,
+        slice_project as run_slice_project,
+    )
+    from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
+    from forma_core.workspaces.projects.state import ProjectArtifact
+
+    try:
+        ir = HardwareIntermediateRepresentation.model_validate(manifest.project_ir)
+    except Exception as exc:
+        raise LocalProjectError("Project manifest contains invalid HardwareIntermediateRepresentation.") from exc
+    cad = ir.cad_model if isinstance(ir.cad_model, dict) else {}
+    mesh_path = str(cad.get("preview_path") or "").strip()
+    if not mesh_path:
+        for artifact in manifest.artifacts:
+            if (artifact.media_type or "").lower() == "model/stl":
+                mesh_path = artifact.path
+                break
+    if not mesh_path:
+        raise LocalProjectError("Project has no printable STL mesh artifact. Generate or import CAD first.")
+    mesh = Path(mesh_path).expanduser()
+    if not mesh.is_absolute():
+        mesh = (root / mesh).resolve()
+    if not mesh.is_file():
+        raise LocalProjectError(f"Printable mesh artifact does not exist: {mesh}")
+    registry = load_printer_registry()
+    try:
+        resolved = resolve_slice_profile(
+            registry,
+            printer_id=printer_id,
+            backend=backend,
+            native_config=str(profile) if profile else None,
+            profile_name=profile_name,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise LocalProjectError(str(exc)) from exc
+    output = root / "fabrication" / (output_name or f"{mesh.stem}.gcode")
+    if output_name and Path(output_name).name != output_name:
+        raise LocalProjectError("Slice output name must be a filename, not a path.")
+    mesh_artifact = ProjectArtifact(
+        artifact_id="native-cad-mesh",
+        kind="mesh.stl",
+        uri=str(mesh),
+        media_type="model/stl",
+        checksum=f"sha256:{hashlib.sha256(mesh.read_bytes()).hexdigest()}",
+        metadata={"path": str(mesh)},
+    )
+    try:
+        result = run_slice_project(
+            SliceRequest(
+                mesh_artifact=mesh_artifact,
+                profile=resolved,
+                output_path=str(output),
+                project_id=manifest.project_id,
+            )
+        )
+    except Exception as exc:
+        raise LocalProjectError(str(exc)) from exc
+
+    metadata = dict(ir.assembly_metadata or {})
+    metadata["fabrication"] = {
+        "status": "succeeded",
+        "backend": result.backend,
+        "printer_name": result.printer_name,
+        "profile_name": result.profile_name,
+        "gcode_sha256": result.gcode_artifact.checksum,
+        "report_uri": result.report_artifact.uri if result.report_artifact else None,
+    }
+    ir.assembly_metadata = metadata
+    from forma_core.workspaces.projects.output import persist_project_output
+
+    persist_project_output(ir, prompt_text=manifest.prompt or manifest.title, owner_user_id=LOCAL_OWNER_USER_ID)
+    references = [
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.path not in {"fabrication/" + output.name, "fabrication/" + output.with_suffix(".report.json").name}
+    ]
+    for artifact in (result.gcode_artifact, result.report_artifact):
+        if artifact is None:
+            continue
+        artifact_path = Path(artifact.uri).resolve().relative_to(root.resolve()).as_posix()
+        references.append(
+            ProjectArtifactReference(
+                path=artifact_path,
+                sha256=str(artifact.checksum or "").removeprefix("sha256:"),
+                media_type=artifact.media_type,
+                size_bytes=Path(artifact.uri).stat().st_size,
+            )
+        )
+    updated = ProjectManifest(
+        format=PROJECT_MANIFEST_FORMAT,
+        version=1,
+        project_id=manifest.project_id,
+        workspace_id=manifest.workspace_id,
+        title=manifest.title,
+        prompt=manifest.prompt,
+        visibility=manifest.visibility,
+        project_ir=ir.model_dump(mode="json"),
+        artifacts=references,
+    )
+    write_project_manifest(root / PROJECT_FILENAME, updated)
+    return updated
+
+
 def update_linkage(path: str | Path, **values: Any) -> dict[str, Any]:
     root = project_root(path)
     linkage = {**load_linkage(root), **values}
@@ -414,5 +532,6 @@ __all__ = [
     "project_root",
     "read_project",
     "status_project",
+    "slice_local_project",
     "update_linkage",
 ]

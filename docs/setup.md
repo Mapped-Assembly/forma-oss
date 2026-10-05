@@ -2,6 +2,10 @@
 
 Forma OSS runs a FastAPI backend and a Next.js frontend. Supabase is supported for deployment through the Supabase client; the backend falls back to SQLite for local use.
 
+For detailed CLI commands and runtime settings, see the
+[CLI and runtime reference](runtime-reference.md). For other topics, use the
+[documentation index](README.md).
+
 ## Prerequisites
 - **Python 3.11+**
 - **Node.js 18+**
@@ -11,7 +15,7 @@ Forma OSS runs a FastAPI backend and a Next.js frontend. Supabase is supported f
 ## OpenCode local setup
 
 Forma can run entirely locally while OpenCode supplies the model and authors
-the Hardware IR. Local generation, validation, rendering, and project status do
+the Hardware Intermediate Representation. Local generation, validation, rendering, and project status do
 not require a Forma account. The account is only needed when a project is
 uploaded to Forma Cloud.
 
@@ -146,6 +150,21 @@ deployments on the current monorepo source without relying on a stale PyPI
 wheel. `vercel.json` also excludes local databases, logs, frontend artifacts,
 Rust build output, examples, docs, and tests from the backend function bundle.
 
+Vercel installs the committed `apps/api/uv.lock` with frozen dependency
+resolution. When backend dependencies change, update
+`apps/api/pyproject.toml`, both requirements files, and the lockfile together:
+
+```bash
+uv lock --project apps/api
+uv lock --project apps/api --check
+uv sync --project apps/api --frozen --no-dev
+```
+
+The backend deployment smoke workflow checks that the lockfile is current,
+then imports both API entrypoints and exercises PDF extraction and rendering
+using only the frozen runtime dependencies. A successful `pip install` from
+requirements alone does not verify the dependency set used by Vercel.
+
 ### Environment variables
 Recommended: create a repo-root `.env` (see `.env.example`).
 
@@ -271,12 +290,15 @@ Notes:
 - Supabase mode uses `SUPABASE_URL` plus `SUPABASE_SERVICE_ROLE_KEY` or `SUPABASE_SECRET_KEY`; it does not use a Postgres connection string.
 - Do not use anon, publishable, or `NEXT_PUBLIC_` Supabase keys for the backend. They obey RLS and cannot seed these tables by default.
 - Set `FORMA_AUTH_MODE=local` for a Clerk-free local workspace or `FORMA_AUTH_MODE=clerk` for required Clerk sign-in and per-user settings.
-- Set an optional `FORMA_MCP_API_KEY` of at least 32 random characters when a remote agent host such as NemoClaw needs a durable bearer credential. It grants access only through the MCP routes; Clerk administrator sessions remain accepted there as well.
+- Set an optional `FORMA_A2A_API_KEY` of at least 32 random characters when a remote agent host needs a durable bearer credential for A2A REST, WebSocket, TCP, or MCP transports. The existing `FORMA_MCP_API_KEY` is also accepted for compatibility; Clerk administrator sessions remain accepted where applicable.
+
+Hosted browser access is deny-by-default. Set `FORMA_CORS_ORIGINS` to a comma-separated allowlist of exact frontend origins, for example `https://app.example.com`; wildcard origins are rejected when credentialed CORS is enabled. Request bodies, prompts, inline images, generation rates, and daily generation quotas are bounded by the `FORMA_MAX_*`, `FORMA_GENERATION_RATE_LIMIT`, and `FORMA_GENERATION_QUOTA` settings shown in `apps/api/.env.example`. Service credentials are server-side bearer credentials only and must not be placed in `NEXT_PUBLIC_*` variables or browser bundles.
+- Local unauthenticated A2A/MCP access is allowed only when both `FORMA_DEPLOYMENT_MODE=local` and `FORMA_AUTH_MODE=local` are explicitly set.
 - `FORMA_USER_SECRETS_KEY` is mandatory in every backend runtime; startup logs a critical error and fails when it is absent. It must be a high-entropy server-only secret. Losing or rotating it without a migration makes existing saved API keys undecryptable.
 - Local workspace settings are always encrypted: Supabase-primary environments use `workspace_integration_configs`, while SQLite-primary environments use an encrypted local file even when unrelated Supabase credentials are present. `FORMA_WORKSPACE_SECRETS_KEY` may provide a separate workspace key; otherwise `FORMA_USER_SECRETS_KEY` is used.
 - `FORMA_DEVELOPMENT_MODE=true` selects SQLite for the complete application database when Supabase points at a remote project. For local Supabase testing, `DATABASE_BACKEND=supabase` is honored when `SUPABASE_URL` points at localhost/127.0.0.1. Development mode still disables Supabase Storage writes, so reference and product image data is stored inline unless development mode is disabled. `FORMA_DEV_MODE` is a compatibility alias.
 - `FORMA_DEVELOPMENT_MODE=false` requires the selected LLM provider and exact model to pass a live availability check before generation begins. Production rejects simulation, providers that cannot verify model availability, and fallback models.
-- If Supabase client variables are missing, the backend falls back to `SQLITE_DATABASE_URL` or `sqlite:///./forma.db`.
+- If Supabase client variables are missing, local mode falls back to `SQLITE_DATABASE_URL` or `sqlite:///./forma.db`; hosted mode fails closed instead of selecting SQLite.
 - `DATABASE_BACKEND` can be `supabase` or `sqlite`.
 - `REDIS_URL` and `REDIS_CACHE_PREFIX` are required at backend startup whenever `FORMA_DEVELOPMENT_MODE` is false. Development mode can omit them and fall back directly to the primary database.
 - Docker Compose uses `COMPOSE_DATABASE_BACKEND` instead and defaults it to `sqlite`; this prevents host-only loopback Supabase URLs from breaking the container quickstart. `COMPOSE_SQLITE_DATABASE_URL` optionally overrides the container SQLite URL.

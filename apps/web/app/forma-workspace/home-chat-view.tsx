@@ -8,17 +8,21 @@ import {
   ArrowRight,
   ArrowUpRight,
   KeyRound,
-  Paperclip,
   RefreshCw,
   Settings,
   Square,
-  X,
 } from "lucide-react";
 
 import { shouldOfferFailedBuildRetry } from "../../lib/conversation-build-state";
 import ConversationMessageList, { type ConversationMessage } from "./conversation-message-list";
-import HostedChatMaintenance from "./hosted-chat-maintenance";
+import { AuthoringModeBanner } from "./hosted-chat-maintenance";
 import useChatAutoScroll from "./use-chat-auto-scroll";
+import ChatProjectLayout from "./chat-project-layout";
+import type { ProjectHistoryConfig } from "./project-history";
+import { ChatAttachmentButton, ChatAttachmentSelection } from "./chat-attachments";
+import GenerationModeSelector, { type GenerationMode } from "./generation-mode-selector";
+
+export type { GenerationMode } from "./generation-mode-selector";
 
 type HomeChatViewProps = {
   started: boolean;
@@ -27,8 +31,12 @@ type HomeChatViewProps = {
   messages: ConversationMessage[];
   renderPipelineProgress: (message: ConversationMessage) => ReactNode;
   projectArtifact?: ReactNode;
+  projectArtifactId?: string | null;
+  history?: ProjectHistoryConfig;
   examples: string[];
   onSelectExample: (example: string) => void;
+  generationMode: GenerationMode;
+  onGenerationModeChange: (mode: GenerationMode) => void;
   onSubmit: FormEventHandler<HTMLFormElement>;
   canBuildNow: boolean;
   buildNowLoading: boolean;
@@ -39,13 +47,16 @@ type HomeChatViewProps = {
   needsGenerationProvider: boolean;
   needsImageProvider: boolean;
   selectedImage: string | null;
+  selectedDocumentName: string | null;
   onRemoveImage: () => void;
+  onRemoveDocument: () => void;
   notice: string | null;
   prompt: string;
   onPromptChange: (prompt: string) => void;
   generationActive: boolean;
   onStop: () => void;
   canRetryFailedBuild: boolean;
+  retryLabel?: string;
   retryingFailedBuild: boolean;
   onRetryFailedBuild: () => void;
   hasGenerationInput: boolean;
@@ -54,6 +65,7 @@ type HomeChatViewProps = {
   onImageChange: ChangeEventHandler<HTMLInputElement>;
   onImagePaste: ClipboardEventHandler<HTMLTextAreaElement>;
   readOnly: boolean;
+  authoringActive?: boolean;
 };
 
 export default function HomeChatView({
@@ -63,8 +75,12 @@ export default function HomeChatView({
   messages,
   renderPipelineProgress,
   projectArtifact,
+  projectArtifactId,
+  history,
   examples,
   onSelectExample,
+  generationMode,
+  onGenerationModeChange,
   onSubmit,
   canBuildNow,
   buildNowLoading,
@@ -75,13 +91,16 @@ export default function HomeChatView({
   needsGenerationProvider,
   needsImageProvider,
   selectedImage,
+  selectedDocumentName,
   onRemoveImage,
+  onRemoveDocument,
   notice,
   prompt,
   onPromptChange,
   generationActive,
   onStop,
   canRetryFailedBuild,
+  retryLabel = "Try failed build again",
   retryingFailedBuild,
   onRetryFailedBuild,
   hasGenerationInput,
@@ -90,6 +109,7 @@ export default function HomeChatView({
   onImageChange,
   onImagePaste,
   readOnly,
+  authoringActive = false,
 }: HomeChatViewProps) {
   const { containerRef, endRef, handleScroll } = useChatAutoScroll(conversationKey, messages);
   const promptRef = useRef<HTMLTextAreaElement>(null);
@@ -103,16 +123,17 @@ export default function HomeChatView({
   const primaryActionLabel = generationActive
     ? "Stop generation"
     : retryMode
-      ? "Try failed build again"
+      ? retryLabel
       : inputValid
-        ? "Send context"
+        ? generationMode === "regular" ? "Generate project" : "Send context"
         : "Check hardware idea";
 
   useEffect(() => {
-    if (selectedImage) promptRef.current?.focus();
-  }, [selectedImage]);
+    if (selectedImage || selectedDocumentName) promptRef.current?.focus();
+  }, [selectedImage, selectedDocumentName]);
 
   return (
+    <ChatProjectLayout conversationKey={conversationKey} projectId={projectArtifactId} project={started ? projectArtifact : null} history={history}>
     <section
       className={`${
         !started
@@ -120,22 +141,16 @@ export default function HomeChatView({
           : "w-full max-w-none"
       } flex min-h-0 flex-1 flex-col text-center`}
     >
-      {!started && !readOnly && (
+      {!started && (
         <div className="shrink-0">
           <h1 className="text-2xl font-semibold tracking-tight text-zinc-100 sm:mt-1 sm:text-3xl">
             Turn an idea into a hardware plan.
           </h1>
           <p className="mx-auto mt-1.5 max-w-xl text-xs leading-relaxed text-zinc-400 sm:text-sm">
-            Upload a photo, sketch, or short description. Get parts, wiring, cost, and build steps.
+            Upload a photo, sketch, PDF, or short description. Get parts, wiring, cost, and build steps.
           </p>
         </div>
       )}
-      {readOnly && !started && (
-        <div className="mx-auto w-full max-w-2xl px-3 sm:px-4 md:px-0">
-          <HostedChatMaintenance />
-        </div>
-      )}
-
       <div
         className={`${
           started
@@ -154,22 +169,22 @@ export default function HomeChatView({
             onScroll={handleScroll}
             className="min-h-0 flex-1 space-y-4 overflow-x-hidden overflow-y-auto px-3 pb-5 pt-16 sm:px-4 sm:pb-6 md:pt-5"
           >
-            {readOnly && <HostedChatMaintenance compact />}
+            {authoringActive && <AuthoringModeBanner compact />}
             <ConversationMessageList
               messages={messages}
               renderPipelineProgress={renderPipelineProgress}
               onSelectContextSuggestion={readOnly ? undefined : onSelectContextSuggestion}
               isLoading={readOnly ? false : isLoading}
+              assistantLabel={authoringActive ? "Forma Agent" : "Forma"}
               canBuildNow={readOnly ? false : canBuildNow}
               buildNowLoading={readOnly ? false : buildNowLoading}
               onBuildNow={readOnly ? undefined : onBuildNow}
             />
-            {projectArtifact}
             <div ref={endRef} />
           </div>
         )}
 
-        {!started && !readOnly && (
+        {!started && (
           <div className="mt-auto shrink-0 px-3 py-3 sm:px-4 md:order-2 md:mt-4 md:px-0 md:py-0">
             <div className="flex snap-x gap-3 overflow-x-auto pb-1 sm:grid sm:grid-cols-3 sm:overflow-visible sm:pb-0">
               {examples.map((example) => (
@@ -191,14 +206,12 @@ export default function HomeChatView({
           </div>
         )}
 
-        {!readOnly && (
+        {(!readOnly || !started) && (
           <form
             onSubmit={onSubmit}
-            className={`${
-            started
-              ? "md:sticky md:bottom-0 md:bg-transparent md:pb-3"
-              : "md:static md:order-1 md:bg-transparent md:p-0"
-            } fixed bottom-0 left-0 right-0 z-30 max-h-[calc(100dvh-3rem)] shrink-0 overflow-y-auto overscroll-contain bg-transparent px-3 pb-[max(0.4rem,env(safe-area-inset-bottom))] pt-1 sm:px-4 md:left-auto md:right-auto md:z-20 md:max-h-none md:overflow-visible`}
+            className={started
+              ? "relative z-20 max-h-[50dvh] shrink-0 overflow-y-auto overscroll-contain border-t border-[var(--forma-border)] bg-[var(--forma-page)] px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-4"
+              : "fixed bottom-0 left-0 right-0 z-30 max-h-[calc(100dvh-3rem)] shrink-0 overflow-y-auto overscroll-contain bg-transparent px-3 pb-[max(0.4rem,env(safe-area-inset-bottom))] pt-1 sm:px-4 md:static md:order-1 md:left-auto md:right-auto md:z-20 md:max-h-none md:overflow-visible md:bg-transparent md:p-0"}
           >
           {(needsGenerationProvider || needsImageProvider) && (
             <section className="mb-3 rounded-xl border border-white/5 bg-[#181b22] p-3 text-left sm:p-4" aria-label="Bring your own key setup">
@@ -248,7 +261,7 @@ export default function HomeChatView({
           {notice && (
             <div id="generation-input-notice" role="status" className="mb-3 flex items-start gap-2 rounded-lg border border-amber-300/30 bg-amber-300/10 px-3 py-2 text-xs leading-5 text-amber-100">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
-              <span className="break-anywhere min-w-0 flex-1">{notice}</span>
+              <span className="break-anywhere min-w-0 flex-1">{notice.replace(/\bOpenCode\b/g, "Forma Agent")}</span>
             </div>
           )}
 
@@ -257,30 +270,14 @@ export default function HomeChatView({
               promptRunning ? "prompt-composer-illuminate" : "prompt-composer-idle"
             }`}
           >
-            <input ref={imageInputRef} type="file" accept="image/*" onChange={onImageChange} className="hidden" />
-            {selectedImage && (
-              <div className="mb-2 flex items-start gap-2 rounded-xl border border-[var(--forma-border)] bg-[var(--forma-surface-muted)] p-1.5 pr-2">
-                <img
-                  src={selectedImage}
-                  alt="Attached prompt image"
-                  className="h-16 w-16 shrink-0 rounded-lg object-cover"
-                />
-                <div className="min-w-0 flex-1 py-0.5">
-                  <div className="text-xs font-medium text-[var(--forma-text-strong)]">Image prompt</div>
-                  <div className="mt-0.5 text-[11px] leading-4 text-[var(--forma-text-muted)]">
-                    Add details below, then press Enter.
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={onRemoveImage}
-                  className="rounded-md p-1.5 text-[var(--forma-text-muted)] transition-colors hover:bg-[var(--forma-page)] hover:text-[var(--forma-text-strong)]"
-                  aria-label="Remove image"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            )}
+            <ChatAttachmentSelection
+              imageInputRef={imageInputRef}
+              onImageChange={onImageChange}
+              selectedImage={selectedImage}
+              selectedDocumentName={selectedDocumentName}
+              onRemoveImage={onRemoveImage}
+              onRemoveDocument={onRemoveDocument}
+            />
             <textarea
               ref={promptRef}
               value={prompt}
@@ -300,22 +297,23 @@ export default function HomeChatView({
               placeholder={
                 selectedImage
                   ? "Add constraints, references, or what you want from this image…"
-                  : "Describe the product, constraints, references, and outputs you need…"
+                  : selectedDocumentName
+                    ? "Tell Forma what to build or what to use from this PDF…"
+                    : "Describe the product, constraints, references, and outputs you need…"
               }
               aria-invalid={Boolean(notice)}
               aria-describedby={notice ? "generation-input-notice" : undefined}
               className="min-h-[64px] w-full resize-none border-none bg-transparent text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 sm:min-h-[72px] sm:leading-7"
             />
             <div className="mt-1 flex items-center justify-between gap-2">
-              <button
-                type="button"
-                onClick={() => imageInputRef.current?.click()}
-                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-zinc-800/50 hover:text-zinc-200"
-                aria-label="Attach image"
-                title="Attach an image or paste one from your clipboard"
-              >
-                <Paperclip className="h-4 w-4" />
-              </button>
+              <div className="flex min-w-0 items-center gap-2">
+                <ChatAttachmentButton imageInputRef={imageInputRef} />
+                <GenerationModeSelector
+                  value={generationMode}
+                  onChange={onGenerationModeChange}
+                  disabled={generationActive || isLoading}
+                />
+              </div>
               <div className="flex items-center gap-1.5">
                 {canFinishPrompt && (
                   <span className="prompt-composer-enter-hint hidden sm:inline" aria-hidden="true">
@@ -324,7 +322,11 @@ export default function HomeChatView({
                 )}
                 <button
                   type={generationActive || retryMode ? "button" : "submit"}
-                  onClick={generationActive ? onStop : retryMode ? onRetryFailedBuild : undefined}
+                  onClick={generationActive || retryMode ? (event) => {
+                    event.preventDefault();
+                    if (generationActive) onStop();
+                    else onRetryFailedBuild();
+                  } : undefined}
                   disabled={retryMode ? retryingFailedBuild : !generationActive && (isLoading || !hasGenerationInput || !generationReady)}
                   className={`prompt-composer-send flex h-7 w-7 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed ${
                     canFinishPrompt || retryMode ? "is-ready" : ""
@@ -348,8 +350,8 @@ export default function HomeChatView({
 
           </form>
         )}
-        {started && !readOnly && <div className="h-40 shrink-0 md:hidden" aria-hidden="true" />}
       </div>
     </section>
+    </ChatProjectLayout>
   );
 }

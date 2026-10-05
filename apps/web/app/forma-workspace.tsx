@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
+import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 import {
   generationLlmImageSupport,
@@ -11,9 +12,30 @@ import {
 } from "../lib/active-llms";
 import { buildProjectDocsMarkdown, docsExportFilename } from "../lib/docs-export";
 import { normalizeContextSuggestions } from "../lib/context-suggestions";
-import { usableRuntimeLlmOptions, webConfig, type RuntimeConfigContract } from "../lib/config";
+import { chatActivity, collectChatOperations, settleChatActivityMessages, type ChatActivity } from "../lib/chat-activity";
+import { useChatActivity } from "./forma-workspace/use-chat-activity";
+import {
+  cancelOpenCodeSession,
+  createOpenCodeSession,
+  listOpenCodeEvents,
+  reduceOpenCodeTurn,
+  openCodeDesignNotice,
+  OpenCodePollingError,
+  OPENCODE_POLL_MAX_FAILURES,
+  OPENCODE_STATUS_UNKNOWN,
+  parseOpenCodePendingTurn,
+  withOpenCodeDeadline,
+  type OpenCodePendingTurn,
+  submitOpenCodeCommand,
+  type OpenCodeSession,
+  type OpenCodeTurnState,
+} from "../lib/opencode";
+import { authoringModeEnabled, usableRuntimeLlmOptions, webConfig, type RuntimeConfigContract } from "../lib/config";
+import { hasConversationHistory, loadProjectChatHistory } from "../lib/project-chat-history";
+import ChatAccessStatus, { type ChatAccessLoadState } from "./forma-workspace/chat-access-status";
 import { calculateProjectCostMetrics, resolveProjectComponentInstances } from "../lib/project-cost-metrics";
 import { useFormaAuth } from "../lib/forma-auth";
+import { GalleryImageRequests, GalleryPageCache, galleryPageKey } from "../lib/gallery-loading";
 import {
   isAuthOrSecurityHttpStatus,
   workspaceStatusBadge,
@@ -56,11 +78,18 @@ import {
   formatBytes,
   isFinalVideoStatus,
 } from "./forma-workspace/admin-panels";
-import HomeChatView from "./forma-workspace/home-chat-view";
+import { ChatAttachmentButton, ChatAttachmentSelection, type ChatAttachmentControls } from "./forma-workspace/chat-attachments";
+import HomeChatView, { type GenerationMode } from "./forma-workspace/home-chat-view";
+import ChatProjectLayout, { ChatProjectSurface } from "./forma-workspace/chat-project-layout";
+import { ProjectHistoryProvider, useProjectHistory, type ProjectHistoryConfig } from "./forma-workspace/project-history";
+import ProjectRevisionPreview from "./forma-workspace/project-revision-preview";
+import { revisionId, revisionNumber, revisionFromProject } from "../lib/project-history";
 import ConversationMessageList, {
   type ConversationMessage,
 } from "./forma-workspace/conversation-message-list";
 import HostedChatMaintenance, {
+  AUTHORING_MODE_ACTIVE_MESSAGE,
+  AuthoringModeBanner,
   HOSTED_CHAT_MAINTENANCE_MESSAGE,
 } from "./forma-workspace/hosted-chat-maintenance";
 import useChatAutoScroll from "./forma-workspace/use-chat-auto-scroll";
@@ -79,6 +108,7 @@ import {
   type ProjectGalleryItem,
 } from "./forma-workspace/project-gallery";
 import CadModelPanel from "./forma-workspace/cad-model-panel";
+import ProjectExportsPanel from "./forma-workspace/project-exports-panel";
 import { projectCadModel, resolveCadModel } from "../lib/cad-model";
 import { FormaProjectBrowser, type FormaProjectSummary } from "@isayahc/forma-gui";
 import {
@@ -117,8 +147,6 @@ import {
   Terminal,
   MessageSquare,
   Square,
-  Maximize2,
-  Minimize2,
   Trash2,
   Settings,
   Handshake,
@@ -130,6 +158,7 @@ import {
   Box,
   CircuitBoard,
   BookOpen,
+  Download,
   Clapperboard,
 } from "lucide-react";
 
@@ -154,14 +183,17 @@ const PIPELINE_STALE_AFTER_MS = WORKSPACE_STATUS_STALE_AFTER_MS;
 const RECOVERY_JOB_BATCH_SIZE = 3;
 const RECOVERY_JOB_MAX_BACKOFF_MS = 60000;
 const LOG_POLL_INTERVAL_MS = 5000;
+const AUTHORING_DELIVERY_POLL_MS = 5000;
+const AUTHORING_DELIVERED_SIGNAL_MS = 8000;
 const CHAT_THREAD_STORAGE_PREFIX = "forma.chat.";
 const CHAT_INDEX_STORAGE_KEY = "forma.chatIndex";
 const PINNED_CHATS_STORAGE_KEY = "forma.pinnedChats";
 const LEGACY_PROJECT_CHAT_STORAGE_PREFIX = "forma.projectChat.";
 const MAX_PROJECT_CHAT_MESSAGES = 80;
 const MAX_CHAT_INDEX_ITEMS = 200;
-const INITIAL_CHAT_TIMESTAMP = "2000-01-01T00:00:00.000Z";
 const NEW_PROJECT_TITLE = "New project";
+const EMPTY_GALLERY_IMAGES: Record<string, ProjectImageCandidate | null> = {};
+const EMPTY_PROJECT_HISTORY: any[] = [];
 
 let lastKnownServerStatus: "connected" | "disconnected" | null = null;
 
@@ -210,9 +242,11 @@ type ChatMessage = {
   id: string;
   role: "assistant" | "user" | "system";
   content: string;
-  status?: "idle" | "loading" | "success" | "error" | "cancelled";
+  status?: "idle" | "loading" | "success" | "error" | "cancelled" | "handed-off" | "interrupted";
+  openCodeTurn?: OpenCodePendingTurn | null;
   timestamp: string;
   projectId?: string | null;
+  revisionId?: string | null;
   pipelineProgress?: AgentPipelineProgress | null;
   imagePreview?: string | null;
   contextProjectId?: string | null;
@@ -231,6 +265,7 @@ type ActiveGenerationRun = {
   projectId?: string | null;
   chatId: string;
   assistantMessageId: string | null;
+  openCodeSessionId?: string | null;
   cancelled: boolean;
 };
 
@@ -353,7 +388,7 @@ const defaultAgentPipelineSteps: AgentPipelineStep[] = [
     id: "package_project",
     agent: "Project Packager",
     label: "Packaging project artifacts",
-    description: "Building the HardwareIR, diagrams, validation summary, and saved record.",
+    description: "Building the Hardware Intermediate Representation, diagrams, validation summary, and saved record.",
     duration_ms: 3500,
   },
 ];
@@ -362,7 +397,7 @@ const optionalImagePipelineStep: AgentPipelineStep = {
   id: "image_generation",
   agent: "Product Image Agent",
   label: "Generating product visuals",
-  description: "Creating optional concept images from the completed HardwareIR visual spec.",
+  description: "Creating optional concept images from the completed Hardware Intermediate Representation visual spec.",
   duration_ms: 8000,
   optional: true,
 };
@@ -406,7 +441,7 @@ function formaBrowserProjectFromGalleryItem(item: ProjectGalleryItem): FormaProj
     remix_count: item.remixCount,
     saved: item.saved,
     can_chat: item.canChat,
-    image_url: item.image ? previewableImageSrc(item.image) : null,
+    image_url: item.image ? previewableImageSrc(item.image.src) : null,
   };
 }
 
@@ -450,21 +485,8 @@ function chatTimestamp() {
   return new Date().toISOString();
 }
 
-function initialChatMessages(timestamp: string = INITIAL_CHAT_TIMESTAMP): ChatMessage[] {
-  return [
-    {
-      id: "assistant-welcome",
-      role: "assistant",
-      content:
-        "Tell me what you want to build. I can turn it into a project with parts, wiring, mechanical notes, validation, jobs, and optional product images.",
-      status: "idle",
-      timestamp,
-    },
-  ];
-}
-
 function validChatStatus(value: any): ChatMessage["status"] {
-  return ["idle", "loading", "success", "error", "cancelled"].includes(value) ? value : "idle";
+  return ["idle", "loading", "success", "error", "cancelled", "interrupted"].includes(value) ? value : "idle";
 }
 
 function validChatRole(value: any): ChatMessage["role"] {
@@ -473,6 +495,9 @@ function validChatRole(value: any): ChatMessage["role"] {
 
 function normalizeChatMessage(value: any): ChatMessage | null {
   if (!value || typeof value !== "object" || typeof value.content !== "string") return null;
+  // Older clients saved onboarding copy as an assistant reply. Keep it out of
+  // restored conversations and subsequent writes; real replies keep their IDs.
+  if (value.id === "assistant-welcome") return null;
   const buildExecutionStatus = typeof value.buildExecution?.status === "string"
     ? value.buildExecution.status
     : "";
@@ -484,8 +509,10 @@ function normalizeChatMessage(value: any): ChatMessage | null {
     role: validChatRole(value.role),
     content: value.content,
     status: normalizedStatus,
+    openCodeTurn: parseOpenCodePendingTurn(value.openCodeTurn),
     timestamp: typeof value.timestamp === "string" && value.timestamp ? value.timestamp : chatTimestamp(),
     projectId: typeof value.projectId === "string" ? value.projectId : null,
+    revisionId: revisionId(value.revisionId ?? value.revision_id),
     pipelineProgress: normalizeAgentPipelineProgress(value.pipelineProgress),
     imagePreview: typeof value.imagePreview === "string" ? value.imagePreview : null,
     contextProjectId: typeof value.contextProjectId === "string"
@@ -530,14 +557,15 @@ function chatTitleFromMessages(messages: ChatMessage[], fallback = NEW_PROJECT_T
   return title.length > 80 ? `${title.slice(0, 77)}...` : title;
 }
 
-function persistableChatMessages(messages: ChatMessage[]): ChatMessage[] {
+function persistableChatMessages(messages: unknown[]): ChatMessage[] {
   return messages
     .map(normalizeChatMessage)
     .filter((message: ChatMessage | null): message is ChatMessage => Boolean(message))
+    .filter((message) => !message.id.startsWith("project-context:"))
     .slice(-MAX_PROJECT_CHAT_MESSAGES);
 }
 
-function mergeFetchedChatMessages(remoteMessages: ChatMessage[], localMessages: ChatMessage[]): ChatMessage[] {
+function mergeFetchedChatMessages(remoteMessages: ChatMessage[], localMessages: ChatMessage[], preferLocal = false): ChatMessage[] {
   const localById = new Map(localMessages.map((message) => [message.id, message]));
   const seen = new Set<string>();
   const merged: ChatMessage[] = [];
@@ -550,14 +578,19 @@ function mergeFetchedChatMessages(remoteMessages: ChatMessage[], localMessages: 
       merged.push(remote);
       return;
     }
+    if (preferLocal) {
+      merged.push(local);
+      return;
+    }
 
-    const localIsTerminal = ["success", "error", "cancelled"].includes(local.status || "");
+    const localIsTerminal = ["success", "error", "cancelled", "interrupted"].includes(local.status || "");
     const remoteRegressed = localIsTerminal && remote.status === "loading";
     merged.push({
       ...local,
       ...remote,
       content: remoteRegressed ? local.content : remote.content,
       status: remoteRegressed ? local.status : remote.status,
+      openCodeTurn: remoteRegressed ? local.openCodeTurn : remote.openCodeTurn ?? local.openCodeTurn,
       timestamp: remoteRegressed ? local.timestamp : remote.timestamp,
       projectId: remote.projectId || local.projectId || null,
       pipelineProgress: remote.pipelineProgress || local.pipelineProgress || null,
@@ -572,10 +605,6 @@ function mergeFetchedChatMessages(remoteMessages: ChatMessage[], localMessages: 
     if (!seen.has(local.id)) merged.push(local);
   });
   return merged.slice(-MAX_PROJECT_CHAT_MESSAGES);
-}
-
-function chatIsWaiting(messages: ChatMessage[]) {
-  return messages.some((message) => message.status === "loading");
 }
 
 function chatMessageIdentityKey(messages: ChatMessage[]) {
@@ -1181,20 +1210,10 @@ function upsertChatListItem(items: ChatListItem[], item: Partial<ChatListItem> &
     .slice(0, MAX_CHAT_INDEX_ITEMS);
 }
 
-function initialProjectChatMessages(projectId: string, title: string, sourcePrompt?: string | null): ChatMessage[] {
+function initialProjectChatMessages(projectId: string, title: string): ChatMessage[] {
   const messages: ChatMessage[] = [];
-  if (sourcePrompt?.trim()) {
-    messages.push({
-      id: newChatMessageId(),
-      role: "user",
-      content: sourcePrompt.trim(),
-      status: "idle",
-      timestamp: chatTimestamp(),
-      projectId,
-    });
-  }
   messages.push({
-    id: newChatMessageId(),
+    id: `project-context:${projectId}`,
     role: "assistant",
     content: `${title || "Project"} is the active project for this chat.`,
     status: "success",
@@ -1497,6 +1516,21 @@ const communityProjects = [
     description: "Compact controller example with display, sensor, and validated power rails.",
     file: "smart_thermostat.json",
   },
+  {
+    title: "Two meshing gears",
+    description: "20/40-tooth OpenCAD gears with real meshes and synchronized 2:1 rotation.",
+    file: "spur_gear_pair.json",
+  },
+  {
+    title: "Print-in-place hinge",
+    description: "Two-body captive hinge benchmark with explicit radial/axial clearance and OpenCAD motion.",
+    file: "print_in_place_hinge.json",
+  },
+  {
+    title: "Monolithic flexure",
+    description: "Single-solid compliant hinge benchmark with an explicitly approximate deformation preview.",
+    file: "monolithic_flexure_hinge.json",
+  },
 ];
 
 type ChatRouteTransition = {
@@ -1530,6 +1564,7 @@ const workspaceTabs = [
   { id: "cad", label: "CAD", icon: Box },
   { id: "schematic", label: "Electrical", icon: CircuitBoard },
   { id: "assembly", label: "Documentation", icon: BookOpen },
+  { id: "exports", label: "Exports", icon: Download },
   { id: "video", label: "Media", icon: Clapperboard },
 ];
 
@@ -1589,6 +1624,7 @@ function withProjectResponseMetadata(ir: any, response: any) {
       can_chat: Boolean(response?.can_chat ?? response?.canChat ?? ir.assembly_metadata?.can_chat ?? ir.assembly_metadata?.canChat),
       frontend_job_id: ir.assembly_metadata?.frontend_job_id || response?.job_id,
       source_prompt: ir.assembly_metadata?.source_prompt || response?.prompt,
+      canonical_revision_id: response?.revision_id || ir.assembly_metadata?.canonical_revision_id,
       ...timingMetadata,
     },
   };
@@ -1699,11 +1735,14 @@ export function FormaWorkspace({
     userImageUrl,
   } = useFormaAuth();
   const chatStorageScope = authRequired ? `identity:${authIdentityKey}` : "local";
+  const chatStorageScopeRef = useRef(chatStorageScope);
+  useLayoutEffect(() => { chatStorageScopeRef.current = chatStorageScope; }, [chatStorageScope]);
+  const galleryIdentityKey = JSON.stringify([API_URL, authRequired, authIdentityKey, Boolean(isSignedIn)]);
   const [prompt, setPrompt] = useState("");
   const [activeChatId, setActiveChatId] = useState(() => currentRouteChatId ? safeDecodeChatId(currentRouteChatId) : newBuildChatId());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => initialChatMessages());
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [pendingHumanContext, setPendingHumanContext] = useState<PendingHumanContext | null>(null);
   const contextProjectIdsRef = useRef<Record<string, string>>({});
   const contextBuildWatchersRef = useRef<Set<string>>(new Set());
@@ -1712,9 +1751,14 @@ export function FormaWorkspace({
   const [resettingBuildMessageId, setResettingBuildMessageId] = useState<string | null>(null);
   const [contextSubmitting, setContextSubmitting] = useState(false);
   const [chatThreads, setChatThreads] = useState<Record<string, ChatMessage[]>>({});
+  const [liveChatMessageIds, setLiveChatMessageIds] = useState<Set<string>>(() => new Set());
+  useEffect(() => setLiveChatMessageIds(new Set()), [authIdentityKey]);
   const [projectChatInput, setProjectChatInput] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const [activeGeneration, setActiveGeneration] = useState<ActiveGenerationState | null>(null);
+  const [workspaceLoading, setIsLoading] = useState(false);
+  const [generationRuns, setGenerationRuns] = useState<Record<string, ActiveGenerationState>>({});
+  const activeGeneration = generationRuns[activeChatId] || null;
+  const isLoading = workspaceLoading || Boolean(activeGeneration);
+  const hasGenerationRuns = Object.keys(generationRuns).length > 0;
   const [activeTab, setActiveTab] = useState("overview");
   const [projectIR, setProjectIR] = useState<any>(null);
   const currentCadModel = projectCadModel(projectIR);
@@ -1727,16 +1771,26 @@ export function FormaWorkspace({
   const [projectHistoryTotal, setProjectHistoryTotal] = useState(0);
   const [myProjectHistoryTotal, setMyProjectHistoryTotal] = useState(0);
   const [projectHistoryLoaded, setProjectHistoryLoaded] = useState(false);
+  const [projectHistoryKey, setProjectHistoryKey] = useState<string | null>(null);
+  const [projectHistoryError, setProjectHistoryError] = useState<Error | null>(null);
+  const projectPageCacheRef = useRef(new GalleryPageCache<{ items: any[]; total: number }>());
+  const projectHistoryAbortRef = useRef<AbortController | null>(null);
+  const galleryImageRequestsRef = useRef(new GalleryImageRequests<ProjectImageCandidate | null>());
   const [myProjectHistoryLoaded, setMyProjectHistoryLoaded] = useState(false);
+  const [myProjectHistoryError, setMyProjectHistoryError] = useState<Error | null>(null);
   const [projectSearchInput, setProjectSearchInput] = useState("");
   const [projectSearchQuery, setProjectSearchQuery] = useState("");
+  const [myProjectSearchInput, setMyProjectSearchInput] = useState("");
+  const [myProjectSearchQuery, setMyProjectSearchQuery] = useState("");
   const [localChatItems, setLocalChatItems] = useState<ChatListItem[]>([]);
   const [privateChatItems, setPrivateChatItems] = useState<ChatListItem[]>([]);
   const [privateChatsLoaded, setPrivateChatsLoaded] = useState(false);
   const [chatIndexLoaded, setChatIndexLoaded] = useState(false);
   const [sessionChatItems, setSessionChatItems] = useState<ChatListItem[]>([]);
   const [pinnedChatIds, setPinnedChatIds] = useState<Set<string>>(new Set());
-  const [projectGalleryImages, setProjectGalleryImages] = useState<Record<string, ProjectImageCandidate | null>>({});
+  const [galleryImageState, setGalleryImageState] = useState<{
+    scope: string; images: Record<string, ProjectImageCandidate | null>;
+  }>({ scope: "", images: {} });
   const [visibleProjectGalleryIds, setVisibleProjectGalleryIds] = useState<string[]>([]);
   const [routeProjectError, setRouteProjectError] = useState<string | null>(null);
   const [pendingProjectDeletion, setPendingProjectDeletion] = useState<PendingProjectDeletion | null>(null);
@@ -1759,10 +1813,23 @@ export function FormaWorkspace({
   );
   const [authSecurityError, setAuthSecurityError] = useState(false);
   const [statusClockMs, setStatusClockMs] = useState(() => Date.now());
+  const [deliveredSignal, setDeliveredSignal] = useState(false);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [selectedImageSource, setSelectedImageSource] = useState<"upload" | "clipboard">("upload");
+  const [selectedDocument, setSelectedDocument] = useState<{
+    name: string;
+    mediaType: "application/pdf";
+    dataUrl: string;
+  } | null>(null);
   const [generationInputNotice, setGenerationInputNotice] = useState<string | null>(null);
   const [hostedChatEnabled, setHostedChatEnabled] = useState(DEFAULT_HOSTED_CHAT_ENABLED);
+  const [runtimeConfigState, setRuntimeConfigState] = useState<{ identityKey: string; status: ChatAccessLoadState }>({
+    identityKey: authIdentityKey,
+    status: "loading",
+  });
+  const chatAccessState = (authRequired && !authLoaded) || runtimeConfigState.identityKey !== authIdentityKey
+    ? "loading"
+    : runtimeConfigState.status;
   const [videoGenerationConfig, setVideoGenerationConfig] = useState<VideoGenerationConfig>({
     configured: null,
     reason: null,
@@ -1783,7 +1850,12 @@ export function FormaWorkspace({
     imageRequired: false,
   });
   const [formaDevMode, setFormaDevMode] = useState(false);
+  const [authoringMode, setAuthoringMode] = useState(false);
+  const [openCodeConnectorId, setOpenCodeConnectorId] = useState<string | null>(null);
   const [generateProductImage, setGenerateProductImage] = useState(false);
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("regular");
+  const [visualDecisionBusy, setVisualDecisionBusy] = useState<"approve" | "revise" | "continue_to_cad" | null>(null);
+  const [visualDecisionError, setVisualDecisionError] = useState<string | null>(null);
   const [generationWorkflow, setGenerationWorkflow] = useState(DEFAULT_WORKFLOW_ID);
   const [generationWorkflows, setGenerationWorkflows] = useState<GenerationWorkflowOption[]>(defaultGenerationWorkflows);
   const [agentPipelineSteps, setAgentPipelineSteps] = useState<AgentPipelineStep[]>(defaultAgentPipelineSteps);
@@ -1804,6 +1876,8 @@ export function FormaWorkspace({
   const fileInputRefCenter = useRef<HTMLInputElement>(null);
   const projectsSectionRef = useRef<HTMLElement>(null);
   const chatPersistenceTimersRef = useRef<Record<string, number>>({});
+  const chatPersistenceVersionsRef = useRef<Record<string, number>>({});
+  const pendingChatWritesRef = useRef(new Set<string>());
   const projectHistoryRequestIdRef = useRef(0);
   const myProjectHistoryRequestIdRef = useRef(0);
   const generationLlmRequestIdRef = useRef(0);
@@ -1812,7 +1886,17 @@ export function FormaWorkspace({
   const pipelineStepsRequestStartedRef = useRef(false);
   const pipelineStepsLastRequestedWorkflowRef = useRef<string | null>(null);
   const recoveryJobMissesRef = useRef(new Map<string, { misses: number; retryAfter: number }>());
-  const activeGenerationRef = useRef<ActiveGenerationRun | null>(null);
+  const generationRunsRef = useRef(new Map<string, ActiveGenerationRun>());
+  const openCodeSessionsRef = useRef<Record<string, OpenCodeSession>>({});
+  const [openCodeRetries, setOpenCodeRetries] = useState<Record<string, {
+    message: string; assistantMessageId: string; projectId?: string | null;
+  }>>({});
+  const openCodeCursorsRef = useRef<Record<string, number>>({});
+  const openCodePollTimersRef = useRef<Record<string, number>>({});
+  const activeChatIdRef = useRef(activeChatId);
+  useLayoutEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
   const visibleChatSourceProjects = myProjectHistory;
   const visibleChatSourceItems = useMemo(
     () => authRequired
@@ -1829,16 +1913,28 @@ export function FormaWorkspace({
     ),
     [pinnedChatIds, visibleChatSourceProjects, visibleChatSourceItems]
   );
+  const imageScopeKey = `${galleryIdentityKey}:${formaDevMode}`;
+  const projectGalleryImages = galleryImageState.scope === imageScopeKey
+    ? galleryImageState.images : EMPTY_GALLERY_IMAGES;
+  const currentGalleryPageKey = galleryPageKey(
+    galleryIdentityKey, PROJECT_GALLERY_PAGE_SIZE, projectHistoryPage, projectSearchQuery,
+  );
+  const cachedGalleryPage = projectPageCacheRef.current.get(currentGalleryPageKey);
+  const hasCurrentGalleryPage = projectHistoryKey === currentGalleryPageKey;
+  const visibleProjectHistory = hasCurrentGalleryPage
+    ? projectHistory : cachedGalleryPage?.items || EMPTY_PROJECT_HISTORY;
+  const visibleProjectTotal = hasCurrentGalleryPage
+    ? projectHistoryTotal : cachedGalleryPage?.total || 0;
   const projectGalleryItems = useMemo(
     () => buildProjectGalleryItems(
-      projectHistory,
+      visibleProjectHistory,
       projectGalleryImages,
       formaDevMode,
     ).map((item) => ({
       ...item,
       canChat: item.canChat && (!authRequired || Boolean(isSignedIn)),
     })),
-    [authRequired, formaDevMode, isSignedIn, projectHistory, projectGalleryImages]
+    [authRequired, formaDevMode, isSignedIn, visibleProjectHistory, projectGalleryImages]
   );
   const projectBrowserItems = useMemo(
     () => projectGalleryItems.map(formaBrowserProjectFromGalleryItem),
@@ -1860,7 +1956,7 @@ export function FormaWorkspace({
     [myProjectGalleryItems]
   );
   const chatHistoryLoaded = myProjectHistoryLoaded && privateChatsLoaded;
-  const projectsPageLoading = !projectHistoryLoaded;
+  const projectsPageLoading = !(hasCurrentGalleryPage && projectHistoryLoaded) && !cachedGalleryPage;
   const myProjectsPageLoading = (authRequired && !authLoaded)
     || !myProjectHistoryLoaded;
   const handleVisibleProjectGalleryIdsChange = useCallback((projectIds: string[]) => {
@@ -1869,7 +1965,6 @@ export function FormaWorkspace({
     ));
   }, []);
   const handleProjectHistoryPageChange = useCallback((page: number) => {
-    setProjectHistoryLoaded(false);
     setVisibleProjectGalleryIds([]);
     setProjectHistoryPage(page);
   }, []);
@@ -1895,10 +1990,13 @@ export function FormaWorkspace({
     return null;
   }, [activeChatId, chatMessages, chatThreads]);
   const generationInputValidation = useMemo(
-    () => validateGenerationInput(pendingHumanContext?.basePrompt || prompt, Boolean(selectedImage)),
-    [pendingHumanContext, prompt, selectedImage]
+    () => validateGenerationInput(
+      pendingHumanContext?.basePrompt || prompt,
+      Boolean(selectedImage || selectedDocument),
+    ),
+    [pendingHumanContext, prompt, selectedDocument, selectedImage]
   );
-  const hasGenerationInput = Boolean(prompt.trim() || selectedImage || pendingHumanContext);
+  const hasGenerationInput = Boolean(prompt.trim() || selectedImage || selectedDocument || pendingHumanContext);
   const selectedGenerationWorkflow = useMemo(
     () => generationWorkflows.find((workflow) => workflow.id === generationWorkflow) || generationWorkflows[0] || defaultGenerationWorkflows[0],
     [generationWorkflow, generationWorkflows]
@@ -1919,14 +2017,26 @@ export function FormaWorkspace({
   const needsGenerationProvider = generationLlmsLoaded && providerSetup.llmRequired && (!authRequired || authLoaded);
   const needsImageProvider = imageGenerationConfigLoaded && providerSetup.imageRequired && (!authRequired || authLoaded);
   const visibleContextInputNotice =
-    generationInputNotice || ((prompt.trim() || selectedImage) && !generationInputValidation.isValid
+    generationInputNotice || ((prompt.trim() || selectedImage || selectedDocument) && !generationInputValidation.isValid
       ? generationInputValidation.message
       : null);
   const hostedChatReadOnly = !hostedChatEnabled;
+  const chatReadOnly = chatAccessState !== "ready" || (hostedChatReadOnly && !authoringMode);
   const requireHostedChatEnabled = () => {
     if (hostedChatEnabled) return true;
     setGenerationInputNotice(HOSTED_CHAT_MAINTENANCE_MESSAGE);
     return false;
+  };
+  const trackLiveChatMessage = (id: string, status: ChatMessage["status"]) => {
+    if (!status) return;
+    setLiveChatMessageIds((current) => {
+      const live = status === "loading";
+      if (current.has(id) === live) return current;
+      const next = new Set(current);
+      if (live) next.add(id);
+      else next.delete(id);
+      return next;
+    });
   };
   const appendChatMessage = (message: Omit<ChatMessage, "id" | "timestamp"> & { id?: string }) => {
     const nextMessage: ChatMessage = {
@@ -1945,10 +2055,12 @@ export function FormaWorkspace({
       buildJobId: message.buildJobId || null,
       timestamp: chatTimestamp(),
     };
+    trackLiveChatMessage(nextMessage.id, nextMessage.status);
     setChatMessages((current) => [...current, nextMessage]);
     return nextMessage.id;
   };
   const updateChatMessage = (id: string, patch: Partial<Omit<ChatMessage, "id">>) => {
+    trackLiveChatMessage(id, patch.status);
     setChatMessages((current) =>
       current.map((message) =>
         message.id === id
@@ -1962,18 +2074,32 @@ export function FormaWorkspace({
     );
   };
 
-  const ensureChatThread = (projectId: string | null, ir: any, sourcePrompt?: string | null) => {
+  const ensureChatThread = async (projectId: string | null, ir: any, routedChatId?: string, signal?: AbortSignal) => {
     if (!projectId) return;
-    const chatId = chatIdFromIR(ir) || projectId;
+    const chatId = routedChatId || chatIdFromIR(ir) || projectId;
     setActiveChatId(chatId);
+    const cached = chatThreads[chatId] || readStoredChatThread(chatId, projectId, chatStorageScope);
+    let messages = cached;
+    if (!hasConversationHistory(cached)) {
+      try {
+        messages = persistableChatMessages(await loadProjectChatHistory({
+          apiUrl: API_URL, chatId, projectId, headers: await generationRequestHeaders(),
+          recoverOpenCode: authoringMode || ir?.assembly_metadata?.authoring_agent === "opencode", signal,
+        }));
+      } catch (error) {
+        if (!signal?.aborted && chatStorageScopeRef.current === chatStorageScope) {
+          setGenerationInputNotice("Previous messages could not be loaded. Reopen this chat to retry.");
+        }
+        return;
+      }
+    }
+    if (signal?.aborted || chatStorageScopeRef.current !== chatStorageScope) return;
     setChatThreads((current) => {
-      if (current[chatId]?.length) return current;
-      const storedMessages = readStoredChatThread(chatId, projectId, chatStorageScope);
-      const nextMessages = storedMessages.length
-        ? storedMessages
-        : initialProjectChatMessages(projectId, ir?.overview?.title || "Project", sourcePrompt);
-      writeStoredChatThread(chatId, nextMessages, chatStorageScope);
-      persistChatThread(chatId, nextMessages, ir?.overview?.title || null);
+      const nextMessages = messages.length
+        ? mergeFetchedChatMessages(messages, hasConversationHistory(current[chatId] || []) ? current[chatId] : [], true)
+        : hasConversationHistory(current[chatId] || []) ? current[chatId]
+        : initialProjectChatMessages(projectId, ir?.overview?.title || "Project");
+      if (hasConversationHistory(nextMessages)) writeStoredChatThread(chatId, nextMessages, chatStorageScope);
       return {
         ...current,
         [chatId]: nextMessages,
@@ -1999,6 +2125,7 @@ export function FormaWorkspace({
       buildJobId: message.buildJobId || null,
       timestamp: chatTimestamp(),
     };
+    trackLiveChatMessage(nextMessage.id, nextMessage.status);
     setChatThreads((current) => {
       const nextMessages = [...(current[chatId] || []), nextMessage].slice(-MAX_PROJECT_CHAT_MESSAGES);
       writeStoredChatThread(chatId, nextMessages, chatStorageScope);
@@ -2013,6 +2140,7 @@ export function FormaWorkspace({
 
   const updateThreadMessage = (chatId: string | null, messageId: string, patch: Partial<Omit<ChatMessage, "id">>) => {
     if (!chatId || !messageId) return;
+    trackLiveChatMessage(messageId, patch.status);
     setChatThreads((current) => {
       const currentMessages = current[chatId] || [];
       const nextMessages = currentMessages.map((message) =>
@@ -2109,6 +2237,7 @@ export function FormaWorkspace({
           return (Number.isNaN(rightTime) ? 0 : rightTime) - (Number.isNaN(leftTime) ? 0 : leftTime);
         })
     );
+    projectPageCacheRef.current.clear();
     setProjectHistory((projects) => (
       normalizedRecord.visibility === "public"
         ? mergeProject(projects)
@@ -2120,6 +2249,11 @@ export function FormaWorkspace({
 
   const detachMissingProjectFromChat = (chatId: string, projectId: string, title?: string | null) => {
     if (!chatId || !projectId) return;
+    const clearProjectReference = (items: ChatListItem[]) => items.map((item) => (
+      item.chatId === chatId ? { ...item, projectId: "", projectCount: 0 } : item
+    ));
+    setSessionChatItems(clearProjectReference);
+    setPrivateChatItems(clearProjectReference);
     setLocalChatItems((current) => {
       const existing = current.find((item) => item.chatId === chatId);
       const nextItem: ChatListItem = {
@@ -2202,6 +2336,7 @@ export function FormaWorkspace({
     const apply = (projects: any[]) => projects.map((project) => (
       project?.project_id === projectId ? { ...project, ...updates } : project
     ));
+    projectPageCacheRef.current.clear();
     setProjectHistory(apply);
     setMyProjectHistory(apply);
   }, []);
@@ -2349,12 +2484,13 @@ export function FormaWorkspace({
       const relatedChatIds = chatListItems
         .filter((item) => item.projectId === projectId)
         .map((item) => item.chatId);
+      projectPageCacheRef.current.clear();
       setProjectHistory((projects) => projects.filter((project: any) => project?.project_id !== projectId));
       setMyProjectHistory((projects) => projects.filter((project: any) => project?.project_id !== projectId));
-      setProjectGalleryImages((images) => {
-        const next = { ...images };
-        delete next[projectId];
-        return next;
+      setGalleryImageState((current) => {
+        const images = { ...current.images };
+        delete images[projectId];
+        return { ...current, images };
       });
       forgetChatRecords(relatedChatIds);
       relatedChatIds.forEach((chatId) => {
@@ -2446,16 +2582,17 @@ export function FormaWorkspace({
   });
   const waitingGenerationJobKey = useMemo(() => {
     const jobIds = new Set<string>();
+    const liveJobIds = new Set(Object.values(generationRuns).map((run) => run.jobId));
     const collect = (messages: ChatMessage[]) => {
       messages.forEach((message) => {
         const jobId = message.status === "loading" && !message.buildPlanId ? message.pipelineProgress?.jobId : null;
-        if (jobId && !jobId.startsWith("generation-") && jobId !== activeGeneration?.jobId) jobIds.add(jobId);
+        if (jobId && !jobId.startsWith("generation-") && !liveJobIds.has(jobId)) jobIds.add(jobId);
       });
     };
     collect(chatMessages);
     Object.values(chatThreads).forEach(collect);
     return Array.from(jobIds).join("\n");
-  }, [activeGeneration?.jobId, chatMessages, chatThreads]);
+  }, [generationRuns, chatMessages, chatThreads]);
   const pendingContextBuildMessage = useMemo(
     () => [...chatMessages].reverse().find((message) => (
       message.status === "loading"
@@ -2496,23 +2633,28 @@ export function FormaWorkspace({
             lastEventAt: lastEvent?.observed_at || progress?.uiUpdatedAt || null,
           }
         : null,
+      authoring: authoringMode,
+      delivered: deliveredSignal,
       nowMs: statusClockMs,
     });
-  }, [authSecurityError, latestAgentOperation, serverStatus, statusClockMs]);
+  }, [authSecurityError, authoringMode, deliveredSignal, latestAgentOperation, serverStatus, statusClockMs]);
 
 
   const persistChatThread = (chatId: string | null, messages: ChatMessage[], explicitTitle?: string | null) => {
-    if (!hostedChatEnabled || (authRequired && !isSignedIn) || !chatId || typeof window === "undefined") return;
+    if (!(hostedChatEnabled || authoringMode) || (authRequired && !isSignedIn) || !chatId || typeof window === "undefined") return;
     const nextMessages = persistableChatMessages(messages);
-    if (!chatHasStarted(nextMessages)) return;
+    if (!chatHasStarted(nextMessages) || !hasConversationHistory(nextMessages)) return;
     const listedTitle = chatListItems.find((item) => item.chatId === chatId)?.title?.trim() || "";
     const title = explicitTitle?.trim()
       || (listedTitle && listedTitle !== NEW_PROJECT_TITLE ? listedTitle : chatTitleFromMessages(nextMessages));
     const existingTimer = chatPersistenceTimersRef.current[chatId];
     if (existingTimer) window.clearTimeout(existingTimer);
+    const version = (chatPersistenceVersionsRef.current[chatId] || 0) + 1;
+    chatPersistenceVersionsRef.current[chatId] = version;
+    pendingChatWritesRef.current.add(chatId);
     chatPersistenceTimersRef.current[chatId] = window.setTimeout(async () => {
       delete chatPersistenceTimersRef.current[chatId];
-      if (!hostedChatEnabled) return;
+      if (!(hostedChatEnabled || authoringMode) || chatStorageScopeRef.current !== chatStorageScope) return;
       try {
         const res = await fetch(`${API_URL}/chats/${encodeURIComponent(chatId)}`, {
           method: "PUT",
@@ -2525,6 +2667,8 @@ export function FormaWorkspace({
         });
         if (!res.ok) throw new Error(await readApiErrorMessage(res));
         const savedChat = await res.json();
+        if (chatStorageScopeRef.current !== chatStorageScope || chatPersistenceVersionsRef.current[chatId] !== version) return;
+        pendingChatWritesRef.current.delete(chatId);
         setPrivateChatItems((current) => mergeChatListItems(normalizePrivateChatItems([savedChat]), current));
       } catch (error) {
         console.error("Error saving private chat", error);
@@ -2555,13 +2699,14 @@ export function FormaWorkspace({
       createdAt: chatTimestamp(),
       projectCount: 0,
     });
-    setChatMessages(initialChatMessages());
+    setChatMessages([]);
     setPrompt("");
     setProjectChatInput("");
     setPendingHumanContext(null);
     setGenerationInputNotice(null);
     setSelectedImage(null);
     setSelectedImageSource("upload");
+    setSelectedDocument(null);
     setChatRouteTransition(null);
     setProjectIR(null);
     setActiveTab("overview");
@@ -2569,7 +2714,7 @@ export function FormaWorkspace({
   };
 
   const goHome = () => {
-    if (!hostedChatEnabled) {
+    if (chatReadOnly) {
       setChatRouteTransition(null);
       setProjectIR(null);
       setActiveTab("overview");
@@ -2587,7 +2732,6 @@ export function FormaWorkspace({
   };
 
   const startNewProjectChat = () => {
-    if (!requireHostedChatEnabled()) return;
     if (homeView === "chat" && !currentRouteProjectId && !currentProjectChatHasStarted()) return;
     const nextChatId = resetToNewProjectChat();
     router.push(chatRoute(nextChatId));
@@ -2599,13 +2743,14 @@ export function FormaWorkspace({
       return;
     }
     setActiveChatId(item.chatId);
+    setGenerationInputNotice(null);
     setActiveTab("overview");
     const storedMessages = readStoredChatThread(item.chatId, null, chatStorageScope);
     if (storedMessages.length) {
       setChatThreads((current) => ({ ...current, [item.chatId]: storedMessages }));
       setChatMessages(storedMessages);
     } else {
-      setChatMessages(initialChatMessages());
+      setChatMessages([]);
     }
     const projectAlreadyLoaded = Boolean(
       item.projectId && projectIdFromIR(projectIR) === item.projectId
@@ -2626,6 +2771,7 @@ export function FormaWorkspace({
       return;
     }
     setActiveChatId(chatId);
+    setGenerationInputNotice(null);
     setActiveTab("overview");
     setChatRouteTransition({
       chatId,
@@ -2661,31 +2807,52 @@ export function FormaWorkspace({
     setLocalChatItems(authRequired ? [] : readStoredChatIndex(chatStorageScope));
     setPinnedChatIds(new Set(readPinnedChatIds(chatStorageScope)));
     setChatIndexLoaded(true);
-    setChatMessages((current) => (
-      current.length === 1 && current[0]?.id === "assistant-welcome"
-        ? [{ ...current[0], timestamp: chatTimestamp() }]
-        : current
-    ));
   }, [authRequired, chatStorageScope]);
+
+  useLayoutEffect(() => {
+    projectPageCacheRef.current.clear();
+    projectHistoryRequestIdRef.current += 1;
+    projectHistoryAbortRef.current?.abort();
+    return () => {
+      projectHistoryRequestIdRef.current += 1;
+      projectHistoryAbortRef.current?.abort();
+    };
+  }, [galleryIdentityKey]);
+
+  useEffect(() => {
+    const requests = galleryImageRequestsRef.current;
+    return () => requests.clear();
+  }, []);
 
   useEffect(() => {
     if (homeView !== "projects") return;
     void fetchProjectHistory(projectHistoryPage, projectSearchQuery);
     // Public gallery data becomes critical only when its route is active.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [homeView, projectHistoryPage, projectSearchQuery]);
+  }, [homeView, projectHistoryPage, projectSearchQuery, galleryIdentityKey, authLoaded]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
       const nextQuery = projectSearchInput.trim();
       if (nextQuery === projectSearchQuery) return;
-      setProjectHistoryLoaded(false);
       setVisibleProjectGalleryIds([]);
       setProjectHistoryPage(0);
       setProjectSearchQuery(nextQuery);
     }, 300);
     return () => window.clearTimeout(timeout);
   }, [projectSearchInput, projectSearchQuery]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      const nextQuery = myProjectSearchInput.trim();
+      if (nextQuery === myProjectSearchQuery) return;
+      setMyProjectHistoryLoaded(false);
+      setVisibleProjectGalleryIds([]);
+      setMyProjectHistoryPage(0);
+      setMyProjectSearchQuery(nextQuery);
+    }, 300);
+    return () => window.clearTimeout(timeout);
+  }, [myProjectSearchInput, myProjectSearchQuery]);
 
   useDeferredTask(() => {
     if (!projectHistoryLoaded) void fetchProjectHistory(projectHistoryPage, projectSearchQuery);
@@ -2707,6 +2874,7 @@ export function FormaWorkspace({
   useEffect(() => {
     if (!authRequired || !authLoaded) return;
     generationLlmRequestIdRef.current += 1;
+    setRuntimeConfigState({ identityKey: authIdentityKey, status: "loading" });
     setGenerationLlmsLoaded(false);
     setGenerationLlms([]);
     setGenerationLlmKeyValue("");
@@ -2745,7 +2913,7 @@ export function FormaWorkspace({
     }
     void fetchMyProjectHistory(myProjectHistoryPage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authIdentityKey, authLoaded, authRequired, isSignedIn, myProjectHistoryPage]);
+  }, [authIdentityKey, authLoaded, authRequired, isSignedIn, myProjectHistoryPage, myProjectSearchQuery]);
 
   useDeferredTask(() => {
     void fetchAgentPipelineSteps(generationWorkflow);
@@ -2760,7 +2928,7 @@ export function FormaWorkspace({
   }, [generationWorkflow]);
 
   useEffect(() => {
-    if (!isLoading) return;
+    if (!isLoading && !hasGenerationRuns) return;
 
     const intervalId = window.setInterval(() => {
       const nowMs = Date.now();
@@ -2780,7 +2948,7 @@ export function FormaWorkspace({
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [isLoading]);
+  }, [isLoading, hasGenerationRuns]);
 
   const checkServerStatus = async () => {
     try {
@@ -2797,18 +2965,28 @@ export function FormaWorkspace({
   const fetchRuntimeConfig = async () => {
     const requestId = ++generationLlmRequestIdRef.current;
     const requestIsCurrent = () => generationLlmRequestIdRef.current === requestId;
+    setRuntimeConfigState({ identityKey: authIdentityKey, status: "loading" });
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 20_000);
     try {
       const res = await fetch(`${API_URL}/runtime/config`, {
         cache: "no-store",
         headers: await optionalAuthHeaders(),
+        signal: controller.signal,
       });
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(`Runtime config request failed (${res.status})`);
 
       const config = (await res.json()) as RuntimeConfigContract;
       if (!requestIsCurrent()) return;
       if (typeof config.deployment?.hosted_chat_enabled === "boolean") {
         setHostedChatEnabled(config.deployment.hosted_chat_enabled);
       }
+      setAuthoringMode(authoringModeEnabled(config));
+      setOpenCodeConnectorId(
+        typeof config.deployment?.opencode_connector_id === "string" && config.deployment.opencode_connector_id.trim()
+          ? config.deployment.opencode_connector_id.trim()
+          : null,
+      );
       setFormaDevMode(config.forma_dev_mode === true);
       const activeLlms = usableRuntimeLlmOptions(config);
       const selectedLlm = config.generation.selected_llm;
@@ -2855,9 +3033,14 @@ export function FormaWorkspace({
             : workflows[0].id,
         );
       }
+      setRuntimeConfigState({ identityKey: authIdentityKey, status: "ready" });
     } catch (e) {
-      if (requestIsCurrent()) console.error("Error fetching runtime config", e);
+      if (requestIsCurrent()) {
+        console.error("Error fetching runtime config", e);
+        setRuntimeConfigState({ identityKey: authIdentityKey, status: "error" });
+      }
     } finally {
+      window.clearTimeout(timeout);
       if (requestIsCurrent()) {
         setGenerationLlmsLoaded(true);
         setImageGenerationConfigLoaded(true);
@@ -2893,9 +3076,24 @@ export function FormaWorkspace({
     page: number = projectHistoryPage,
     search: string = projectSearchQuery,
   ) => {
-    const requestId = projectHistoryRequestIdRef.current + 1;
-    projectHistoryRequestIdRef.current = requestId;
-    setProjectHistoryLoaded(false);
+    const requestId = ++projectHistoryRequestIdRef.current;
+    projectHistoryAbortRef.current?.abort();
+    const controller = new AbortController();
+    projectHistoryAbortRef.current = controller;
+    const isCurrent = () => !controller.signal.aborted && projectHistoryRequestIdRef.current === requestId;
+    const key = galleryPageKey(galleryIdentityKey, PROJECT_GALLERY_PAGE_SIZE, page, search);
+    const cached = projectPageCacheRef.current.get(key);
+    setProjectHistoryError(null);
+    if (cached) {
+      setProjectHistory(cached.items);
+      setProjectHistoryTotal(cached.total);
+      setProjectHistoryKey(key);
+      setProjectHistoryLoaded(true);
+    } else if (projectHistoryKey !== key) {
+      setProjectHistoryLoaded(false);
+    }
+    // A same-page refresh keeps the current cards mounted. A cached page can
+    // also render immediately, but every visit still revalidates permissions.
     try {
       const params = new URLSearchParams({
         limit: String(PROJECT_GALLERY_PAGE_SIZE),
@@ -2903,31 +3101,55 @@ export function FormaWorkspace({
       });
       const normalizedSearch = search.trim();
       if (normalizedSearch) params.set("q", normalizedSearch);
+      const headers = await optionalAuthHeaders();
+      if (!isCurrent()) return;
       const res = await fetch(`${API_URL}/projects?${params.toString()}`, {
-        headers: await optionalAuthHeaders(),
+        signal: controller.signal,
+        headers,
       });
-      if (projectHistoryRequestIdRef.current !== requestId) return;
-      if (res.ok) {
-        const result = normalizeProjectListPage(await res.json());
-        if (projectHistoryRequestIdRef.current !== requestId) return;
-        setProjectHistory(result.items);
-        setProjectHistoryTotal(result.total);
-        if (!authRequired) {
-          setLocalChatItems((current) => {
-            const repairedItems = buildChatListItems(result.items, current);
-            writeStoredChatIndex(repairedItems, chatStorageScope);
-            return repairedItems;
-          });
+      if (!isCurrent()) return;
+      if (!res.ok) {
+        if (isAuthOrSecurityHttpStatus(res.status)) {
+          projectPageCacheRef.current.clear();
+          setProjectHistory([]);
+          setProjectHistoryTotal(0);
         }
+        throw new Error(await readApiErrorMessage(res));
       }
-    } catch (e) {
-      console.error("Error fetching project history", e);
+      const result = normalizeProjectListPage(await res.json());
+      if (!isCurrent()) return;
+      projectPageCacheRef.current.set(key, result);
+      setProjectHistory(result.items);
+      setProjectHistoryTotal(result.total);
+      setProjectHistoryKey(key);
+      if (!authRequired) {
+        setLocalChatItems((current) => {
+          const repairedItems = buildChatListItems(result.items, current);
+          writeStoredChatIndex(repairedItems, chatStorageScope);
+          return repairedItems;
+        });
+      }
+    } catch (error) {
+      if (!isCurrent()) return;
+      if (!cached && projectHistoryKey !== key) {
+        setProjectHistory([]);
+        setProjectHistoryTotal(0);
+      }
+      setProjectHistoryKey(key);
+      setProjectHistoryError(error instanceof Error ? error : new Error("Projects could not be loaded."));
+      console.error("Error fetching project history", error);
     } finally {
-      if (projectHistoryRequestIdRef.current === requestId) setProjectHistoryLoaded(true);
+      if (isCurrent()) {
+        setProjectHistoryLoaded(true);
+        projectHistoryAbortRef.current = null;
+      }
     }
   };
 
-  const fetchMyProjectHistory = async (page: number = myProjectHistoryPage) => {
+  const fetchMyProjectHistory = async (
+    page: number = myProjectHistoryPage,
+    search: string = myProjectSearchQuery,
+  ) => {
     const requestId = myProjectHistoryRequestIdRef.current + 1;
     myProjectHistoryRequestIdRef.current = requestId;
     if (authRequired && !authLoaded) {
@@ -2937,16 +3159,20 @@ export function FormaWorkspace({
     if (authRequired && !isSignedIn) {
       setMyProjectHistory([]);
       setMyProjectHistoryTotal(0);
+      setMyProjectHistoryError(new Error("Sign in to view your projects."));
       setMyProjectHistoryLoaded(true);
       return;
     }
 
     setMyProjectHistoryLoaded(false);
+    setMyProjectHistoryError(null);
     try {
       const params = new URLSearchParams({
         limit: String(PROJECT_GALLERY_PAGE_SIZE),
         offset: String(Math.max(0, page) * PROJECT_GALLERY_PAGE_SIZE),
       });
+      const normalizedSearch = search.trim();
+      if (normalizedSearch) params.set("q", normalizedSearch);
       const res = await fetch(`${API_URL}/my/projects?${params.toString()}`, {
         headers: await generationRequestHeaders(),
       });
@@ -2956,15 +3182,19 @@ export function FormaWorkspace({
         if (myProjectHistoryRequestIdRef.current !== requestId) return;
         setMyProjectHistory(result.items);
         setMyProjectHistoryTotal(result.total);
+        setMyProjectHistoryError(null);
         setAuthSecurityError(false);
       } else if (isAuthOrSecurityHttpStatus(res.status)) {
         if (isSignedIn) setAuthSecurityError(true);
         setMyProjectHistory([]);
         setMyProjectHistoryTotal(0);
+        setMyProjectHistoryError(new Error("Sign in to view your projects."));
       } else {
         throw new Error(await readApiErrorMessage(res));
       }
     } catch (e) {
+      if (myProjectHistoryRequestIdRef.current !== requestId) return;
+      setMyProjectHistoryError(e instanceof Error ? e : new Error("Projects could not be loaded."));
       console.error("Error fetching my project history", e);
     } finally {
       if (myProjectHistoryRequestIdRef.current === requestId) setMyProjectHistoryLoaded(true);
@@ -2983,6 +3213,10 @@ export function FormaWorkspace({
       return;
     }
 
+    const versions = { ...chatPersistenceVersionsRef.current };
+    const pending = new Set(pendingChatWritesRef.current);
+    const keepLocal = (chatId: string) => pending.has(chatId) || pendingChatWritesRef.current.has(chatId)
+      || versions[chatId] !== chatPersistenceVersionsRef.current[chatId];
     try {
       const res = await fetch(`${API_URL}/chats`, {
         headers: await generationRequestHeaders(),
@@ -2990,6 +3224,7 @@ export function FormaWorkspace({
       if (res.ok) {
         setAuthSecurityError(false);
         const chats = await res.json();
+        if (chatStorageScopeRef.current !== chatStorageScope) return;
         setPrivateChatItems(normalizePrivateChatItems(chats));
         const threadUpdates: Record<string, ChatMessage[]> = {};
         if (Array.isArray(chats)) {
@@ -3004,14 +3239,14 @@ export function FormaWorkspace({
           setChatThreads((current) => {
             const next = { ...current };
             Object.entries(threadUpdates).forEach(([chatId, remoteMessages]) => {
-              const mergedMessages = mergeFetchedChatMessages(remoteMessages, current[chatId] || []);
+              const mergedMessages = mergeFetchedChatMessages(remoteMessages, current[chatId] || [], keepLocal(chatId));
               next[chatId] = mergedMessages;
               writeStoredChatThread(chatId, mergedMessages, chatStorageScope);
             });
             return next;
           });
           if (activeChatId && threadUpdates[activeChatId]) {
-            setChatMessages((current) => mergeFetchedChatMessages(threadUpdates[activeChatId], current));
+            setChatMessages((current) => mergeFetchedChatMessages(threadUpdates[activeChatId], current, keepLocal(activeChatId)));
           }
         }
       } else if (isAuthOrSecurityHttpStatus(res.status)) {
@@ -3151,74 +3386,82 @@ export function FormaWorkspace({
 
 
   useEffect(() => {
-    if (currentRouteProjectId || projectIR) return;
-    const visibleProjectIds = new Set(visibleProjectGalleryIds);
-    if (!visibleProjectIds.size) return;
-
-    const imageProjects = mergeProjectRecords(
-      mergeProjectRecords(projectHistory, myProjectHistory),
-      projectRecordsFromChatItems(chatListItems)
-    ).filter((project: any) => {
+    const galleryActive = (homeView === "projects" || homeView === "my-projects")
+      && !currentRouteProjectId && !projectIR;
+    const visibleProjectIds = new Set(galleryActive ? visibleProjectGalleryIds : []);
+    const imageProjects = homeView === "my-projects" ? myProjectHistory : visibleProjectHistory;
+    const missingIds = imageProjects.filter((project: any) => {
       const projectId = project?.project_id ? String(project.project_id) : "";
-      return projectId && visibleProjectIds.has(projectId);
-    });
-    const missingProjects = imageProjects.filter((project: any) => {
-      const projectId = project?.project_id ? String(project.project_id) : "";
-      const summaryImage =
-        resolveProjectImageCandidates({
-          product_visual_sequence: project.product_visual_sequence,
-          product_image_url: project.product_image_url,
-          product_image_data: project.product_image_data,
-          product_image_content_type: project.product_image_content_type,
-          product_image_model: project.product_image_model,
-          image_output_model: project.image_output_model,
-        }, formaDevMode)[0] || null;
-      return projectId && !summaryImage && projectGalleryImages[projectId] === undefined;
-    });
-    if (!missingProjects.length) return;
-
-    let cancelled = false;
-    const controller = new AbortController();
-
-    Promise.all(
-      missingProjects.map(async (project: any): Promise<[string, ProjectImageCandidate | null]> => {
-        const projectId = String(project.project_id);
-        try {
-          const res = await fetch(`${API_URL}/projects/${encodeURIComponent(projectId)}/image-summary`, {
-            signal: controller.signal,
-            headers: await optionalAuthHeaders(),
-          });
-          if (!res.ok) return [projectId, null];
-
-          const data = await res.json();
-          return [projectId, resolveProjectImageCandidates(data || {}, formaDevMode)[0] || null];
-        } catch (error) {
-          if (!controller.signal.aborted) {
-            console.error("Error fetching project image", error);
-          }
-          return [projectId, null];
-        }
-      })
-    ).then((entries) => {
-      if (cancelled) return;
-      setProjectGalleryImages((current) => {
-        const next = { ...current };
-        entries.forEach(([projectId, image]) => {
-          next[projectId] = image;
-        });
-        return next;
-      });
-    });
-
-    return () => {
-      cancelled = true;
-      controller.abort();
+      if (!visibleProjectIds.has(projectId) || projectGalleryImages[projectId] !== undefined) return false;
+      return !resolveProjectImageCandidates({
+        product_visual_sequence: project.product_visual_sequence,
+        product_image_url: project.product_image_url,
+        product_image_data: project.product_image_data,
+        product_image_content_type: project.product_image_content_type,
+        product_image_model: project.product_image_model,
+        image_output_model: project.image_output_model,
+      }, formaDevMode)[0];
+    }).map((project: any) => String(project.project_id));
+    const storeImage = (projectId: string, image: ProjectImageCandidate | null) => {
+      setGalleryImageState((current) => ({
+        scope: imageScopeKey,
+        images: { ...(current.scope === imageScopeKey ? current.images : {}), [projectId]: image },
+      }));
     };
-  }, [formaDevMode, chatListItems, currentRouteProjectId, myProjectHistory, optionalAuthHeaders, projectHistory, projectGalleryImages, projectIR, visibleProjectGalleryIds]);
+    galleryImageRequestsRef.current.sync(
+      imageScopeKey,
+      missingIds,
+      async (projectId, signal) => {
+        const headers = await optionalAuthHeaders();
+        signal.throwIfAborted();
+        const res = await fetch(`${API_URL}/projects/${encodeURIComponent(projectId)}/image-summary`, {
+          signal, headers,
+        });
+        if (!res.ok) return null;
+        return resolveProjectImageCandidates(await res.json(), formaDevMode)[0] || null;
+      },
+      storeImage,
+      (projectId, error) => {
+        console.error("Error fetching project image", error);
+        storeImage(projectId, null);
+      },
+    );
+    // No per-render cleanup: settling one image must not abort its siblings.
+    // sync cancels obsolete IDs/scope; the separate cleanup handles unmount.
+  }, [formaDevMode, homeView, imageScopeKey, currentRouteProjectId, myProjectHistory, optionalAuthHeaders, visibleProjectHistory, projectGalleryImages, projectIR, visibleProjectGalleryIds]);
 
-  const attachImageFile = (file: File, source: "upload" | "clipboard" = "upload") => {
+  const attachReferenceFile = (file: File, source: "upload" | "clipboard" = "upload") => {
+    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    if (isPdf) {
+      const maxPdfBytes = 2 * 1024 * 1024;
+      if (file.size > maxPdfBytes) {
+        setGenerationInputNotice("PDF context files are limited to 2 MB. Split or compress the PDF and try again.");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result !== "string") {
+          setGenerationInputNotice("Forma could not read that PDF. Try exporting it again.");
+          return;
+        }
+        setSelectedImage(null);
+        setSelectedDocument({
+          name: file.name || "reference.pdf",
+          mediaType: "application/pdf",
+          dataUrl: reader.result,
+        });
+        setGenerationMode("progressive");
+        setGenerationInputNotice("PDF attached. Forma will extract its text into project context.");
+      };
+      reader.onerror = () => {
+        setGenerationInputNotice("Forma could not read that PDF. Try uploading it again.");
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+
     if (!file.type.startsWith("image/")) {
-      setGenerationInputNotice("Only image files can be attached as hardware references.");
+      setGenerationInputNotice("Attach an image or PDF as a hardware reference.");
       return;
     }
     const reader = new FileReader();
@@ -3228,6 +3471,7 @@ export function FormaWorkspace({
         return;
       }
       setGenerationInputNotice(null);
+      setSelectedDocument(null);
       setSelectedImage(reader.result);
       setSelectedImageSource(source);
     };
@@ -3239,7 +3483,9 @@ export function FormaWorkspace({
 
   const handleImageChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file) attachImageFile(file, "upload");
+    // Permit selecting the same file again on a later turn or after validation fails.
+    event.target.value = "";
+    if (file) attachReferenceFile(file, "upload");
   };
 
   const handleImagePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -3247,13 +3493,20 @@ export function FormaWorkspace({
       || Array.from(event.clipboardData.items)
         .find((item) => item.type.startsWith("image/"))
         ?.getAsFile();
-    if (imageFile) attachImageFile(imageFile, "clipboard");
+    if (imageFile) attachReferenceFile(imageFile, "clipboard");
   };
 
   const removeSelectedImage = () => {
     setGenerationInputNotice(null);
     setSelectedImage(null);
     setSelectedImageSource("upload");
+    if (fileInputRefSidebar.current) fileInputRefSidebar.current.value = "";
+    if (fileInputRefCenter.current) fileInputRefCenter.current.value = "";
+  };
+
+  const removeSelectedDocument = () => {
+    setGenerationInputNotice(null);
+    setSelectedDocument(null);
     if (fileInputRefSidebar.current) fileInputRefSidebar.current.value = "";
     if (fileInputRefCenter.current) fileInputRefCenter.current.value = "";
   };
@@ -3265,19 +3518,19 @@ export function FormaWorkspace({
       jobId: null,
       chatId,
       assistantMessageId: null,
+      openCodeSessionId: null,
       cancelled: false,
     };
-    activeGenerationRef.current = run;
-    setActiveGeneration({ kind, jobId: null });
-    setIsLoading(true);
+    generationRunsRef.current.set(chatId, run);
+    setGenerationRuns((current) => ({ ...current, [chatId]: { kind, jobId: null } }));
     return run;
   };
 
   const setGenerationRunJob = (run: ActiveGenerationRun, jobId: string, assistantMessageId: string) => {
     run.jobId = jobId;
     run.assistantMessageId = assistantMessageId;
-    if (activeGenerationRef.current === run) {
-      setActiveGeneration({ kind: run.kind, jobId });
+    if (generationRunsRef.current.get(run.chatId) === run) {
+      setGenerationRuns((current) => ({ ...current, [run.chatId]: { kind: run.kind, jobId } }));
     }
   };
 
@@ -3288,7 +3541,7 @@ export function FormaWorkspace({
     chatId: string,
     assistantMessageId: string,
   ) => {
-    const active = activeGenerationRef.current;
+    const active = generationRunsRef.current.get(chatId);
     if (active?.kind === "context-build" && active.planId === planId) return active;
     const run = beginGenerationRun("context-build", chatId);
     run.projectId = projectId;
@@ -3298,10 +3551,14 @@ export function FormaWorkspace({
   };
 
   const finishGenerationRun = (run: ActiveGenerationRun) => {
-    if (activeGenerationRef.current !== run) return;
-    activeGenerationRef.current = null;
-    setActiveGeneration(null);
-    setIsLoading(false);
+    if (generationRunsRef.current.get(run.chatId) !== run) return;
+    if (run.assistantMessageId) trackLiveChatMessage(run.assistantMessageId, "idle");
+    generationRunsRef.current.delete(run.chatId);
+    setGenerationRuns((current) => {
+      const next = { ...current };
+      delete next[run.chatId];
+      return next;
+    });
   };
 
   const cancelGenerationJob = async (jobId: string) => {
@@ -3372,7 +3629,7 @@ export function FormaWorkspace({
     const projectId = message.contextProjectId;
     const planId = message.buildPlanId;
     if (!projectId || !planId) return;
-    const active = activeGenerationRef.current;
+    const active = generationRunsRef.current.get(activeChatId);
     if (active?.kind === "context-build" && active.planId === planId) {
       stopActiveGeneration();
       return;
@@ -3385,8 +3642,8 @@ export function FormaWorkspace({
     void cancelContextBuild(projectId, planId);
   };
 
-  const stopActiveGeneration = () => {
-    const run = activeGenerationRef.current;
+  const stopActiveGeneration = (chatId = activeChatId) => {
+    const run = generationRunsRef.current.get(chatId);
     if (!run) return;
 
     run.cancelled = true;
@@ -3406,7 +3663,14 @@ export function FormaWorkspace({
         ? "Build stopped. Your project brief is preserved."
         : "Generation stopped. You can send another message whenever you're ready.",
     );
-    if (run.kind === "context-build" && run.projectId && run.planId) {
+    if (authoringMode && run.openCodeSessionId) {
+      window.clearTimeout(openCodePollTimersRef.current[run.openCodeSessionId]);
+      delete openCodePollTimersRef.current[run.openCodeSessionId];
+      delete openCodeSessionsRef.current[run.chatId];
+      void generationRequestHeaders()
+        .then((headers) => cancelOpenCodeSession(API_URL, headers, run.openCodeSessionId || ""))
+        .catch(() => undefined);
+    } else if (run.kind === "context-build" && run.projectId && run.planId) {
       void cancelContextBuild(run.projectId, run.planId);
     } else if (run.jobId) {
       void cancelGenerationJob(run.jobId);
@@ -3500,6 +3764,7 @@ export function FormaWorkspace({
           updateChatMessage(assistantMessageId, {
             content: readyMessage,
             status: "success",
+            ...revisionFromProject(ir),
             pipelineProgress: synchronizedProgress,
             projectId,
             contextProjectId: projectId,
@@ -3508,6 +3773,7 @@ export function FormaWorkspace({
           updateThreadMessage(chatId, assistantMessageId, {
             content: readyMessage,
             status: "success",
+            ...revisionFromProject(ir),
             pipelineProgress: synchronizedProgress,
             projectId,
             contextProjectId: projectId,
@@ -3581,13 +3847,16 @@ export function FormaWorkspace({
           return;
         }
         if (attempts >= 600) {
-          const message = error instanceof Error ? error.message : "Could not read build progress.";
-          setGenerationInputNotice(message);
-          contextBuildWatchersRef.current.delete(watcherKey);
-          return;
+          setGenerationInputNotice("Live build updates were interrupted. Checking the saved build status.");
         }
       }
-      if (attempts < 600) window.setTimeout(poll, 2000);
+      if (attempts >= 600) {
+        contextBuildWatchersRef.current.delete(watcherKey);
+        trackLiveChatMessage(assistantMessageId, "idle");
+        if (run) finishGenerationRun(run);
+        return;
+      }
+      window.setTimeout(poll, 2000);
     };
     window.setTimeout(poll, 750);
   };
@@ -3598,7 +3867,7 @@ export function FormaWorkspace({
     const planId = message.buildPlanId;
     const jobId = message.buildJobId;
     const chatId = activeChatId;
-    if (!projectId || !planId || !jobId || !chatId || activeGenerationRef.current) return;
+    if (!projectId || !planId || !jobId || !chatId || generationRunsRef.current.has(chatId)) return;
 
     setResettingBuildMessageId(message.id);
     setGenerationInputNotice(null);
@@ -3674,59 +3943,47 @@ export function FormaWorkspace({
     );
   };
 
-  useEffect(() => {
-    if (!hostedChatEnabled) return;
-    const pending = [...chatMessages].reverse().find((message) => (
-      message.status === "loading"
-      && Boolean(message.buildPlanId)
-      && Boolean(message.buildJobId)
-      && Boolean(message.contextProjectId)
-      && !message.projectId
-    ));
-    if (!pending?.buildPlanId || !pending.buildJobId || !pending.contextProjectId || !activeChatId) return;
-    if (!pending.pipelineProgress) {
-      const progress = createAgentPipelineProgress(
-        defaultAgentPipelineSteps,
-        generateProductImage,
-        chatTimestamp(),
-        pending.buildJobId,
-      );
-      updateChatMessage(pending.id, { pipelineProgress: progress, status: "loading" });
-      updateThreadMessage(activeChatId, pending.id, { pipelineProgress: progress, status: "loading" });
-    }
-    const run = beginContextBuildRun(
-      pending.contextProjectId,
-      pending.buildPlanId,
-      pending.buildJobId,
-      activeChatId,
-      pending.id,
-    );
-    watchContextBuild(
-      pending.contextProjectId,
-      pending.buildPlanId,
-      pending.buildJobId,
-      activeChatId,
-      pending.id,
-      run,
-    );
-    // The watcher registry makes this restart-safe without duplicating poll loops.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChatId, chatMessageIdentityKey(chatMessages), hostedChatEnabled]);
+  // Saved builds are observed by useChatActivity. Opening history must not
+  // call executeContextBuild; execution belongs to explicit submit/retry actions.
 
-  const submitGatherContext = async (answer?: string) => {
-    if (!requireHostedChatEnabled()) return;
-    if (contextSubmitting || activeGenerationRef.current) return;
+  const submitGatherContext = async (answer?: string, target?: { chatId: string; projectId: string }) => {
+    if (generationRunsRef.current.has(target?.chatId || activeChatId)) return;
+    if (authoringMode) {
+      if (selectedImage || selectedDocument) {
+        setGenerationInputNotice("Image and PDF attachments are not available in FormaAgent authoring yet.");
+        return;
+      }
+      const text = (answer ?? prompt).trim();
+      if (!text || !openCodeConnectorId) {
+        setGenerationInputNotice(openCodeConnectorId ? "Describe the hardware project you want OpenCode to author." : "FormaAgent authoring is not configured for this deployment.");
+        return;
+      }
+      const requestChatId = activeChatId || newBuildChatId();
+      setActiveChatId(requestChatId);
+      rememberChatItem({ chatId: requestChatId, title: text, projectId: "", createdAt: chatTimestamp(), projectCount: 0 });
+      syncChatRoute(requestChatId);
+      const userMessageId = appendChatMessage({ id: newChatMessageId(), role: "user", content: text, status: "idle" });
+      appendThreadMessage(requestChatId, { id: userMessageId, role: "user", content: text, status: "idle" });
+      const assistantMessageId = appendChatMessage({ id: newChatMessageId(), role: "assistant", content: "Sending to OpenCode…", status: "loading" });
+      appendThreadMessage(requestChatId, { id: assistantMessageId, role: "assistant", content: "Sending to OpenCode…", status: "loading" });
+      setPrompt("");
+      setGenerationInputNotice(null);
+      void submitOpenCodeTurn({ chatId: requestChatId, message: text, assistantMessageId });
+      return;
+    }
+    if (contextSubmitting) return;
     if (!(await requireSignedInForGeneration())) return;
+    if (!requireHostedChatEnabled()) return;
 
     const submittedPrompt = answer ?? prompt;
-    const validation = validateGenerationInput(submittedPrompt, Boolean(selectedImage));
+    const validation = validateGenerationInput(submittedPrompt, Boolean(selectedImage || selectedDocument));
     if (!validation.isValid) {
       setGenerationInputNotice(validation.message);
       return;
     }
 
-    const requestChatId = activeChatId || newBuildChatId();
-    const requestProjectId = contextProjectIdsRef.current[requestChatId] || (
+    const requestChatId = target?.chatId || activeChatId || newBuildChatId();
+    const requestProjectId = target?.projectId || contextProjectIdsRef.current[requestChatId] || (
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestChatId)
         ? requestChatId
         : newBuildChatId()
@@ -3734,26 +3991,30 @@ export function FormaWorkspace({
     contextProjectIdsRef.current[requestChatId] = requestProjectId;
     const text = submittedPrompt.trim();
     const imageData = selectedImage;
+    const documentData = selectedDocument;
     const userMessageId = newChatMessageId();
     const assistantMessageId = newChatMessageId();
-    const userContent = text || "Shared a hardware reference image.";
+    const userContent = text
+      || (documentData ? `Shared ${documentData.name} as project context.` : "Shared a hardware reference image.");
 
     setActiveChatId(requestChatId);
     rememberChatItem({
       chatId: requestChatId,
-      title: text || "Hardware reference",
-      projectId: "",
+      title: target ? projectTitle : text || documentData?.name || "Hardware reference",
+      projectId: target?.projectId || "",
       createdAt: chatTimestamp(),
-      projectCount: 0,
+      projectCount: target ? 1 : 0,
     });
-    syncChatRoute(requestChatId);
+    if (!target) syncChatRoute(requestChatId);
     appendChatMessage({ id: userMessageId, role: "user", content: userContent, imagePreview: imageData, status: "idle" });
     appendThreadMessage(requestChatId, { id: userMessageId, role: "user", content: userContent, imagePreview: imageData, status: "idle" });
     appendChatMessage({ id: assistantMessageId, role: "assistant", content: "Thinking…", status: "loading" });
     appendThreadMessage(requestChatId, { id: assistantMessageId, role: "assistant", content: "Thinking…", status: "loading" });
-    setPrompt("");
+    if (target) setProjectChatInput("");
+    else setPrompt("");
     setSelectedImage(null);
     setSelectedImageSource("upload");
+    setSelectedDocument(null);
     setGenerationInputNotice(null);
     setContextSubmitting(true);
 
@@ -3764,14 +4025,25 @@ export function FormaWorkspace({
         body: JSON.stringify({
           conversation_id: requestChatId,
           text,
-          attachments: imageData ? [{
-            attachment_id: `context-image-${userMessageId}`,
-            kind: "image",
-            name: "hardware-reference.png",
-            media_type: imageData.match(/^data:([^;,]+)/)?.[1] || "image/png",
-            data_url: imageData,
-            source: selectedImageSource,
-          }] : [],
+          generation_mode: generationMode,
+          attachments: [
+            ...(imageData ? [{
+              attachment_id: `context-image-${userMessageId}`,
+              kind: "image",
+              name: "hardware-reference.png",
+              media_type: imageData.match(/^data:([^;,]+)/)?.[1] || "image/png",
+              data_url: imageData,
+              source: selectedImageSource,
+            }] : []),
+            ...(documentData ? [{
+              attachment_id: `context-document-${userMessageId}`,
+              kind: "document",
+              name: documentData.name,
+              media_type: documentData.mediaType,
+              data_url: documentData.dataUrl,
+              source: "upload",
+            }] : []),
+          ],
         }),
       });
       if (!res.ok) {
@@ -3871,7 +4143,11 @@ export function FormaWorkspace({
 
   const handleBuildNow = async () => {
     if (!requireHostedChatEnabled()) return;
-    if (contextBuildStarting || contextSubmitting || activeGenerationRef.current) return;
+    if (authoringMode) {
+      setGenerationInputNotice(AUTHORING_MODE_ACTIVE_MESSAGE);
+      return;
+    }
+    if (contextBuildStarting || contextSubmitting || generationRunsRef.current.has(activeChatId)) return;
     const requestChatId = activeChatId;
     const availableMessages = requestChatId
       ? chatThreads[requestChatId] || chatMessages
@@ -3895,6 +4171,7 @@ export function FormaWorkspace({
         headers: await generationRequestHeaders(),
         body: JSON.stringify({
           conversation_id: requestChatId,
+          generation_mode: generationMode,
           requested_tool: "build_project",
         }),
       });
@@ -3955,9 +4232,9 @@ export function FormaWorkspace({
 
   const handleGenerate = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!requireHostedChatEnabled()) return;
-    if (activeGenerationRef.current) return;
+    if (generationRunsRef.current.has(activeChatId)) return;
     if (!(await requireSignedInForGeneration())) return;
+    if (!requireHostedChatEnabled()) return;
     if (!selectedGenerationLlm) {
       setGenerationInputNotice("Turn on at least one model provider in Settings before building.");
       return;
@@ -4001,7 +4278,7 @@ export function FormaWorkspace({
     const requestChatId = activeChatId || newBuildChatId();
     const generationRun = beginGenerationRun("chat", requestChatId);
 
-    if (!contextCheckpoint) {
+    if (!contextCheckpoint && generationMode !== "regular") {
       setGenerationInputNotice(null);
       try {
         const clarification = await requestHumanContextQuestions(
@@ -4158,6 +4435,7 @@ export function FormaWorkspace({
           client_job_id: frontendJobId,
           image_data: imageData || null,
           generate_image: generateProductImage,
+          generation_mode: generationMode,
         }),
       });
 
@@ -4244,6 +4522,7 @@ export function FormaWorkspace({
       updateChatMessage(assistantMessageId, {
         content: successMessage,
         status: "success",
+        ...revisionFromProject(ir),
         projectId,
       });
       if (projectId) {
@@ -4253,6 +4532,7 @@ export function FormaWorkspace({
         updateThreadMessage(requestChatId, assistantMessageId, {
           content: successMessage,
           status: "success",
+          ...revisionFromProject(ir),
           projectId,
         });
       }
@@ -4348,8 +4628,68 @@ export function FormaWorkspace({
 
   const handleProjectChatGenerate = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (generationRunsRef.current.has(currentProjectChatId || activeChatId)) return;
+    if (selectedImage || selectedDocument) {
+      if (!currentProjectId || !currentUserOwnsProject) return;
+      await submitGatherContext(projectChatInput, {
+        chatId: currentProjectChatId || activeChatId || newBuildChatId(),
+        projectId: currentProjectId,
+      });
+      return;
+    }
+    if (authoringMode) {
+      const handoffProjectId = currentProjectId;
+      const handoffMessage = projectChatInput.trim();
+      if (!handoffProjectId || !projectIR || !handoffMessage || !openCodeConnectorId) {
+        if (!openCodeConnectorId) setGenerationInputNotice("FormaAgent authoring is not configured for this deployment.");
+        return;
+      }
+      const sourceChatId = currentProjectChatId || activeChatId || newBuildChatId();
+      setActiveChatId(sourceChatId);
+      const userMessageId = appendThreadMessage(sourceChatId, {
+        role: "user",
+        content: handoffMessage,
+        status: "idle",
+        projectId: handoffProjectId,
+      });
+      const assistantMessageId = appendThreadMessage(sourceChatId, {
+        role: "assistant",
+        content: "Sending to OpenCode…",
+        status: "loading",
+        projectId: handoffProjectId,
+      });
+      setProjectChatInput("");
+      setGenerationInputNotice(null);
+      if (sourceChatId === activeChatId) {
+        setChatMessages((current) => [
+          ...current,
+          {
+            id: userMessageId,
+            role: "user",
+            content: handoffMessage,
+            status: "idle",
+            projectId: handoffProjectId,
+            timestamp: chatTimestamp(),
+          },
+          {
+            id: assistantMessageId,
+            role: "assistant",
+            content: "Sending to OpenCode…",
+            status: "loading",
+            projectId: handoffProjectId,
+            timestamp: chatTimestamp(),
+          },
+        ]);
+      }
+      void submitOpenCodeTurn({
+        chatId: sourceChatId,
+        message: handoffMessage,
+        projectId: handoffProjectId,
+        assistantMessageId,
+      });
+      return;
+    }
     if (!requireHostedChatEnabled()) return;
-    if (activeGenerationRef.current) return;
     if (!(await requireSignedInForGeneration())) return;
     if (!currentUserOwnsProject) {
       setGenerationInputNotice("You can only chat with projects you own.");
@@ -4366,7 +4706,7 @@ export function FormaWorkspace({
 
     const sourceProjectId = currentProjectId;
     const sourceChatId = currentProjectChatId || activeChatId || newBuildChatId();
-    const targetNamespace = activeTab === "overview" ? null : workspaceNamespaceForTab(activeTab);
+    const targetNamespace = activeTab === "overview" || activeTab === "exports" ? null : workspaceNamespaceForTab(activeTab);
     const generationRun = beginGenerationRun("project-chat", sourceChatId);
     setActiveChatId(sourceChatId);
     rememberChatItem({
@@ -4457,6 +4797,7 @@ export function FormaWorkspace({
       updateThreadMessage(sourceChatId, assistantMessageId, {
         content: successMessage,
         status: "success",
+        ...revisionFromProject(ir),
         projectId: sourceProjectId,
       });
 
@@ -4548,48 +4889,339 @@ export function FormaWorkspace({
 
   const loadOldProject = async (
     projectId: string,
-    options: { syncRoute?: boolean; signal?: AbortSignal; tab?: string | null; hydrateChat?: boolean } = {}
+    options: { syncRoute?: boolean; signal?: AbortSignal; tab?: string | null; hydrateChat?: boolean; chatId?: string; retryTransient?: boolean; openCodeResult?: boolean; onReadiness?: (readiness: unknown) => void } = {}
   ): Promise<boolean> => {
     if (options.signal?.aborted) return false;
 
     const shouldSyncRoute = options.syncRoute ?? true;
     const signal = options.signal;
-    setIsLoading(true);
+    const isVisibleChat = () => !options.chatId || activeChatIdRef.current === options.chatId;
+    if (isVisibleChat()) setIsLoading(true);
     try {
-      const res = await fetch(`${API_URL}/projects/${encodeURIComponent(projectId)}`, {
-        signal,
-        headers: await optionalAuthHeaders(),
-      });
-      if (!res.ok) return false;
+      let res: Response | undefined;
+      const attempts = options.retryTransient ? 3 : 1;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          res = await fetch(`${API_URL}/projects/${encodeURIComponent(projectId)}`, {
+            signal,
+            headers: await (options.openCodeResult ? generationRequestHeaders() : optionalAuthHeaders()),
+            cache: "no-store",
+          });
+        } catch (error) {
+          if (signal?.aborted || attempt === attempts - 1) throw error;
+        }
+        if (res && res.status !== 429 && res.status < 500) break;
+        if (attempt < attempts - 1) await new Promise((resolve) => window.setTimeout(resolve, 500 * (attempt + 1)));
+      }
+      if (!res?.ok) {
+        if (options.openCodeResult && res?.status !== 404) {
+          throw new Error(`OpenCode finished, but its project could not be loaded${res ? ` (HTTP ${res.status})` : ""}. Try opening the saved project again.`);
+        }
+        return false;
+      }
 
       const data = await res.json();
       if (signal?.aborted) return false;
 
-      const ir = withProjectResponseMetadata(data.project_ir, data);
-      setProjectIR(ir);
-      if (options.hydrateChat && canChatWithProjectIR(ir)) {
-        ensureChatThread(projectId, ir, data.prompt);
+      if (!data?.project_ir || typeof data.project_ir !== "object" || !Array.isArray(data.project_ir.components)) {
+        throw new Error("OpenCode finished, but the project response contains no usable Hardware Intermediate Representation. Try opening the saved project again.");
       }
-      setActiveTab(normalizeTab(options.tab || "") || "overview");
-      if (shouldSyncRoute) syncProjectRoute(projectId);
+
+      const ir = withProjectResponseMetadata(data.project_ir, data);
+      options.onReadiness?.(data.project_readiness);
+      if (isVisibleChat()) {
+        if (options.hydrateChat && canChatWithProjectIR(ir)) {
+          await ensureChatThread(projectId, ir, options.chatId, signal);
+        }
+        if (signal?.aborted || !isVisibleChat()) return false;
+        setProjectIR(ir);
+        setActiveTab(normalizeTab(options.tab || "") || "overview");
+        if (shouldSyncRoute) syncProjectRoute(projectId);
+      }
       return true;
     } catch (error) {
       const errorName = error instanceof Error ? error.name : "";
       if (errorName !== "AbortError") {
         console.error(error);
+        if (options.openCodeResult) throw error;
       }
       return false;
     } finally {
-      if (!signal?.aborted) {
+      if (!signal?.aborted && isVisibleChat()) {
         setIsLoading(false);
       }
     }
   };
 
+  const pollOpenCodeTurn = (turn: {
+    chatId: string;
+    sessionId: string;
+    commandId: string;
+    message: string;
+    projectId?: string | null;
+    assistantMessageId: string;
+    run: ActiveGenerationRun;
+    recovery: OpenCodePendingTurn;
+  }) => {
+    let state: OpenCodeTurnState = {
+      assistantMessage: turn.recovery.assistantMessage,
+      content: turn.recovery.assistantMessage || "Waiting for OpenCode.",
+      status: "loading",
+      terminalEvent: null,
+    };
+    let failures = 0;
+    const isCurrent = () => generationRunsRef.current.get(turn.chatId) === turn.run
+      && !turn.run.cancelled && !turn.run.controller.signal.aborted;
+    const poll = async () => {
+      if (!isCurrent()) return;
+      try {
+        const page = await listOpenCodeEvents(
+          API_URL,
+          generationRequestHeaders,
+          turn.sessionId,
+          turn.recovery.cursor,
+          { signal: turn.run.controller.signal },
+        );
+        if (!isCurrent()) return;
+        failures = 0;
+        openCodeCursorsRef.current[turn.sessionId] = page.next_cursor;
+        for (const event of page.events) {
+          if (event.session_id !== turn.sessionId) continue;
+          state = reduceOpenCodeTurn(state, event, turn.commandId);
+        }
+        turn.recovery = { ...turn.recovery, cursor: page.next_cursor, assistantMessage: state.assistantMessage };
+        const patch = { content: state.content, status: state.status, openCodeTurn: state.terminalEvent ? null : turn.recovery };
+        updateThreadMessage(turn.chatId, turn.assistantMessageId, patch);
+        if (activeChatIdRef.current === turn.chatId) updateChatMessage(turn.assistantMessageId, patch);
+        const terminalEvent = state.terminalEvent;
+        if (terminalEvent) {
+          delete openCodePollTimersRef.current[turn.sessionId];
+          const timedOut = terminalEvent.error?.code === "connector_timeout";
+          if (terminalEvent.kind === "cancelled" || timedOut) delete openCodeSessionsRef.current[turn.chatId];
+          if (terminalEvent.kind === "failed") {
+            setOpenCodeRetries((current) => ({ ...current, [turn.chatId]: {
+              message: turn.message, projectId: turn.recovery.targetProjectId, assistantMessageId: turn.assistantMessageId,
+            } }));
+          }
+          let resultLoadError: string | null = null;
+          let resultLoadNotice: string | null = null;
+          if (terminalEvent.kind === "completed") {
+            // A successful conversation need not create a project. Probe before linking it.
+            let projectLoaded = false;
+            try {
+              projectLoaded = await withOpenCodeDeadline((signal) => loadOldProject(terminalEvent.project_id, {
+                syncRoute: false,
+                tab: "chat",
+                signal,
+                chatId: turn.chatId,
+                retryTransient: true,
+                openCodeResult: true,
+                onReadiness: (readiness) => { resultLoadNotice = openCodeDesignNotice(readiness); },
+              }), turn.run.controller.signal, 20_000);
+              if (!projectLoaded) {
+                resultLoadNotice = "OpenCode finished responding, but no saved project is available to this account. If you expected a design, try opening it from your projects or ask OpenCode to check its saved result.";
+              }
+              if (!projectLoaded && terminalEvent.revision_id) {
+                resultLoadError = "OpenCode saved a revision, but the project is not available to this account. Try opening the saved project again.";
+              }
+            } catch (error) {
+              resultLoadError = error instanceof Error && error.message.startsWith("OpenCode")
+                ? error.message
+                : "OpenCode finished, but its project could not be loaded. Check your connection and sign-in, then try opening the saved project again.";
+            }
+            if (!isCurrent()) return;
+            if (projectLoaded) {
+              contextProjectIdsRef.current[turn.chatId] = terminalEvent.project_id;
+              rememberChatItem({
+                chatId: turn.chatId,
+                title: projectTitle || "OpenCode project",
+                projectId: terminalEvent.project_id,
+                createdAt: chatTimestamp(),
+                projectCount: 1,
+              });
+              const projectPatch = { ...patch, projectId: terminalEvent.project_id, revisionId: revisionId(terminalEvent.revision_id) };
+              updateThreadMessage(turn.chatId, turn.assistantMessageId, projectPatch);
+              if (activeChatIdRef.current === turn.chatId) updateChatMessage(turn.assistantMessageId, projectPatch);
+              refreshProjectAndChatLists();
+            }
+          }
+          if (resultLoadError) {
+            const errorPatch = { content: `${state.content}\n\n${resultLoadError}`, status: "error" as const };
+            updateThreadMessage(turn.chatId, turn.assistantMessageId, errorPatch);
+            if (activeChatIdRef.current === turn.chatId) updateChatMessage(turn.assistantMessageId, errorPatch);
+          }
+          if (resultLoadNotice && !resultLoadError && !state.content.includes(resultLoadNotice)) {
+            const noticePatch = { content: `${state.content}\n\n${resultLoadNotice}`, status: state.status };
+            updateThreadMessage(turn.chatId, turn.assistantMessageId, noticePatch);
+            if (activeChatIdRef.current === turn.chatId) updateChatMessage(turn.assistantMessageId, noticePatch);
+          }
+          if (activeChatIdRef.current === turn.chatId) setGenerationInputNotice(resultLoadError || resultLoadNotice);
+          if (activeChatIdRef.current === turn.chatId) setIsLoading(false);
+          finishGenerationRun(turn.run);
+          return;
+        }
+        openCodePollTimersRef.current[turn.sessionId] = window.setTimeout(poll, 1500);
+      } catch (error) {
+        if (!isCurrent()) return;
+        failures += 1;
+        // Codes and counts only: never log credentials, prompts, or response bodies.
+        console.warn("opencode_poll_failed", {
+          code: error instanceof OpenCodePollingError ? error.code : "transport_error",
+          status: error instanceof OpenCodePollingError ? error.httpStatus : undefined,
+          consecutiveFailures: failures,
+        });
+        if (failures >= OPENCODE_POLL_MAX_FAILURES) {
+          delete openCodePollTimersRef.current[turn.sessionId];
+          const patch = {
+            content: [state.assistantMessage, OPENCODE_STATUS_UNKNOWN].filter(Boolean).join("\n\n"),
+            status: "interrupted" as const, openCodeTurn: turn.recovery,
+          };
+          updateThreadMessage(turn.chatId, turn.assistantMessageId, patch);
+          if (activeChatIdRef.current === turn.chatId) {
+            updateChatMessage(turn.assistantMessageId, patch);
+            setGenerationInputNotice(OPENCODE_STATUS_UNKNOWN);
+            setIsLoading(false);
+          }
+          finishGenerationRun(turn.run);
+          return;
+        }
+        if (activeChatIdRef.current === turn.chatId) setGenerationInputNotice("Connection interrupted. Checking request status again…");
+        openCodePollTimersRef.current[turn.sessionId] = window.setTimeout(poll, 3000);
+      }
+    };
+    void poll();
+  };
+
+  const submitOpenCodeTurn = async ({
+    chatId,
+    message,
+    projectId,
+    assistantMessageId,
+  }: {
+    chatId: string;
+    message: string;
+    projectId?: string | null;
+    assistantMessageId: string;
+  }) => {
+    if (generationRunsRef.current.has(chatId)) return;
+    if (!openCodeConnectorId) {
+      const error = "FormaAgent authoring is not configured for this deployment.";
+      updateChatMessage(assistantMessageId, { content: error, status: "error" });
+      updateThreadMessage(chatId, assistantMessageId, { content: error, status: "error" });
+      setGenerationInputNotice(error);
+      return;
+    }
+    setOpenCodeRetries((current) => {
+      const next = { ...current };
+      delete next[chatId];
+      return next;
+    });
+    const pending = { content: "Waiting for Forma Agent.", status: "loading" as const };
+    updateThreadMessage(chatId, assistantMessageId, pending);
+    if (activeChatIdRef.current === chatId) updateChatMessage(assistantMessageId, pending);
+    const run = beginGenerationRun(projectId ? "project-chat" : "chat", chatId);
+    run.assistantMessageId = assistantMessageId;
+    try {
+      const headers = await generationRequestHeaders();
+      if (run.cancelled) return;
+      let session = openCodeSessionsRef.current[chatId];
+      if (!session) {
+        session = await createOpenCodeSession(API_URL, headers, openCodeConnectorId, projectId);
+        // Stop may be clicked before session creation responds. Do not enqueue
+        // a command or replace a newer run's session after that cancellation.
+        if (run.cancelled) {
+          await cancelOpenCodeSession(API_URL, headers, session.session_id);
+          return;
+        }
+        openCodeSessionsRef.current[chatId] = session;
+        openCodeCursorsRef.current[session.session_id] = 0;
+      }
+      run.projectId = session.project_id;
+      run.openCodeSessionId = session.session_id;
+      const command = await submitOpenCodeCommand(API_URL, headers, session.session_id, message);
+      if (run.cancelled) return;
+      setGenerationRunJob(run, command.command_id, assistantMessageId);
+      if (activeChatIdRef.current === chatId) {
+        setGenerationInputNotice("Sent to OpenCode. Live authoring status will appear here.");
+      }
+      const recovery: OpenCodePendingTurn = {
+        sessionId: session.session_id, commandId: command.command_id, projectId: session.project_id,
+        message, targetProjectId: projectId || null, cursor: openCodeCursorsRef.current[session.session_id] || 0, assistantMessage: null,
+      };
+      updateThreadMessage(chatId, assistantMessageId, { openCodeTurn: recovery });
+      if (activeChatIdRef.current === chatId) updateChatMessage(assistantMessageId, { openCodeTurn: recovery });
+      pollOpenCodeTurn({ chatId, sessionId: session.session_id, commandId: command.command_id, message, projectId, assistantMessageId, run, recovery });
+    } catch (error) {
+      if (run.cancelled) return;
+      const messageText = error instanceof Error ? error.message : "OpenCode could not accept this request.";
+      updateChatMessage(assistantMessageId, { content: messageText, status: "error" });
+      updateThreadMessage(chatId, assistantMessageId, { content: messageText, status: "error" });
+      finishGenerationRun(run);
+      if (activeChatIdRef.current === chatId) setGenerationInputNotice(messageText);
+    }
+  };
+
+  const pendingOpenCodeMessage = (chatId: string) => {
+    if (generationRunsRef.current.has(chatId)) return undefined;
+    const messages = chatThreads[chatId]?.length ? chatThreads[chatId] : chatId === activeChatId ? chatMessages : [];
+    return [...messages].reverse().find((message) => message.openCodeTurn
+      && (message.status === "interrupted" || message.status === "loading"));
+  };
+
+  const checkOpenCodeStatus = (chatId: string) => {
+    const message = pendingOpenCodeMessage(chatId);
+    const recovery = message?.openCodeTurn;
+    if (!message || !recovery) return;
+    const run = beginGenerationRun("project-chat", chatId);
+    run.openCodeSessionId = recovery.sessionId;
+    run.projectId = recovery.projectId;
+    setGenerationRunJob(run, recovery.commandId, message.id);
+    const patch = { status: "loading" as const, content: recovery.assistantMessage || "Checking request status…" };
+    updateThreadMessage(chatId, message.id, patch);
+    if (activeChatIdRef.current === chatId) {
+      updateChatMessage(message.id, patch);
+      setGenerationInputNotice(null);
+    }
+    pollOpenCodeTurn({ ...recovery, chatId, assistantMessageId: message.id, run, recovery });
+  };
+
+  // A saved loading turn has no live browser poll after reload. Expose a GET-only
+  // recovery action instead of rendering its historical spinner indefinitely.
+  useEffect(() => {
+    const messages = chatThreads[activeChatId] || chatMessages;
+    if (generationRunsRef.current.has(activeChatId)) return;
+    for (const message of messages) {
+      if (message.status !== "loading" || !message.openCodeTurn) continue;
+      const patch = {
+        status: "interrupted" as const,
+        content: [message.openCodeTurn.assistantMessage, OPENCODE_STATUS_UNKNOWN].filter(Boolean).join("\n\n"),
+      };
+      updateThreadMessage(activeChatId, message.id, patch);
+      updateChatMessage(message.id, patch);
+    }
+    // Updates are scoped to the selected chat and only change orphaned turns.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChatId, chatMessages, chatThreads]);
+
+  useEffect(() => {
+    setGenerationRuns({});
+    setOpenCodeRetries({});
+    const runs = generationRunsRef.current;
+    return () => {
+      runs.forEach((run) => { run.cancelled = true; run.controller.abort(); });
+      runs.clear();
+      Object.values(openCodePollTimersRef.current).forEach(window.clearTimeout);
+      openCodePollTimersRef.current = {};
+      openCodeSessionsRef.current = {};
+      openCodeCursorsRef.current = {};
+    };
+  }, [authIdentityKey]);
+
   const loadedProjectId = projectIdFromIR(projectIR);
 
   useEffect(() => {
     if (currentRouteProjectId || homeView !== "chat" || !inlineChatProjectId || loadedProjectId === inlineChatProjectId) return;
+    if (currentRouteChatId && activeChatId !== safeDecodeChatId(currentRouteChatId)) return;
 
     const controller = new AbortController();
     let retryTimer: number | null = null;
@@ -4608,10 +5240,11 @@ export function FormaWorkspace({
         const data = await res.json();
         if (controller.signal.aborted) return;
         const ir = withProjectResponseMetadata(data.project_ir, data);
-        setProjectIR(ir);
         if (canChatWithProjectIR(ir)) {
-          ensureChatThread(inlineChatProjectId, ir, data.prompt);
+          await ensureChatThread(inlineChatProjectId, ir, currentRouteChatId ? safeDecodeChatId(currentRouteChatId) : undefined, controller.signal);
         }
+        if (controller.signal.aborted) return;
+        setProjectIR(ir);
         setActiveTab("overview");
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -4631,7 +5264,7 @@ export function FormaWorkspace({
     };
     // The project id and loaded project identity fully define this hydration request.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentRouteChatId, currentRouteProjectId, homeView, inlineChatProjectId, loadedProjectId]);
+  }, [activeChatId, currentRouteChatId, currentRouteProjectId, homeView, inlineChatProjectId, loadedProjectId]);
 
   const routedProjectId = currentRouteProjectId ? safeDecodeProjectId(currentRouteProjectId) : "";
 
@@ -4679,21 +5312,45 @@ export function FormaWorkspace({
     const controller = new AbortController();
     const chatId = routedChatId;
     const chatSourcesReady = chatIndexLoaded && chatHistoryLoaded;
-    const storedMessages = !authRequired || (chatSourcesReady && routedChatFound)
+    const storedMessages = !authRequired || chatSourcesReady
       ? readStoredChatThread(chatId, null, chatStorageScope)
       : [];
     setActiveChatId(chatId);
     setActiveTab("overview");
     setRouteProjectError(null);
     if (storedMessages.length) {
-      setChatThreads((current) => ({ ...current, [chatId]: storedMessages }));
-      setChatMessages(storedMessages);
+      // The route transition can finish alongside a reply. Merge with the
+      // latest state so a saved "Thinking…" snapshot cannot replace that reply.
+      setChatThreads((current) => ({
+        ...current,
+        [chatId]: mergeFetchedChatMessages(storedMessages, current[chatId] || [], true),
+      }));
+      setChatMessages((current) => activeChatId === chatId
+        ? mergeFetchedChatMessages(storedMessages, current, true)
+        : storedMessages);
     } else {
-      setChatMessages(initialChatMessages());
+      setChatMessages((current) => activeChatId === chatId ? current : []);
     }
 
     if (!chatSourcesReady) {
       setChatRouteTransition({ chatId, title: "Opening chat", projectId: "", error: null });
+      return () => {
+        controller.abort();
+      };
+    }
+
+    if (!routedChatFound && chatSourcesReady && authRequired && chatHasStarted(storedMessages)) {
+      const recoveredTitle = chatTitleFromMessages(storedMessages);
+      const recoveredItem = {
+        chatId,
+        title: recoveredTitle,
+        projectId: "",
+        createdAt: chatTimestamp(),
+        projectCount: 0,
+      };
+      setSessionChatItems((current) => mergeChatListItems([recoveredItem], current));
+      persistChatThread(chatId, storedMessages, recoveredTitle);
+      setChatRouteTransition(null);
       return () => {
         controller.abort();
       };
@@ -4748,6 +5405,7 @@ export function FormaWorkspace({
       signal: controller.signal,
       tab: "chat",
       hydrateChat: true,
+      chatId,
     }).then((loaded) => {
       if (controller.signal.aborted) return;
       if (loaded) {
@@ -4757,7 +5415,7 @@ export function FormaWorkspace({
       setProjectIR(null);
       setActiveTab("overview");
       const nextMessages = messagesWithoutMissingProject(
-        storedMessages.length ? storedMessages : initialChatMessages(),
+        storedMessages,
         routedChatProjectId
       );
       setChatThreads((current) => ({
@@ -4776,6 +5434,23 @@ export function FormaWorkspace({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [routedChatId, currentRouteProjectId, routedChatFound, routedChatProjectId, inlineChatProjectId, chatIndexLoaded, chatHistoryLoaded, authRequired, isSignedIn, chatStorageScope]);
+
+  useEffect(() => {
+    if (!routedChatId || currentRouteProjectId || chatHistoryLoaded) return;
+    const chatId = routedChatId;
+    const timeoutId = window.setTimeout(() => {
+      setChatRouteTransition((current) => (
+        current?.chatId === chatId && !current.error
+          ? {
+              ...current,
+              title: "Chat unavailable",
+              error: "The chat workspace could not finish loading. Please return home and try again.",
+            }
+          : current
+      ));
+    }, 10000);
+    return () => window.clearTimeout(timeoutId);
+  }, [routedChatId, currentRouteProjectId, chatHistoryLoaded]);
 
   const findProjectForJob = (job: A2AJob) => {
     const projectId = job.result_summary?.project_id;
@@ -4883,18 +5558,75 @@ export function FormaWorkspace({
   const projectTitle = projectIR?.overview?.title || "Untitled Hardware Project";
   const projectDescription = projectIR?.overview?.description || "Generated hardware package";
   const currentProjectId = projectIR?.assembly_metadata?.project_id || null;
+  const currentProjectPrivate = (
+    myProjectHistory.find((project: any) => project.project_id === currentProjectId)?.visibility
+    || projectIR?.assembly_metadata?.visibility
+  ) === "private";
+  const isPublicExample = projectIR?.assembly_metadata?.status === "example" && !currentProjectId;
   const currentUserOwnsProject = Boolean(projectIR && canChatWithProjectIR(projectIR) && (!authRequired || isSignedIn));
+  useEffect(() => {
+    const persistedMode = projectIR?.assembly_metadata?.generation_mode;
+    if (persistedMode === "regular" || persistedMode === "progressive") {
+      setGenerationMode(persistedMode);
+    }
+  }, [currentProjectId, projectIR?.assembly_metadata?.generation_mode]);
   const currentProjectCanDownloadAssets = currentUserOwnsProject;
+  const handleProgressiveVisualDecision = async (
+    decision: "approve" | "revise" | "continue_to_cad",
+    feedback?: string,
+  ) => {
+    if (!currentProjectId || !currentUserOwnsProject || visualDecisionBusy) return;
+    setVisualDecisionBusy(decision);
+    setVisualDecisionError(null);
+    try {
+      const response = await fetch(
+        `${API_URL}/projects/${encodeURIComponent(currentProjectId)}/visual-decision`,
+        {
+          method: "POST",
+          headers: await generationRequestHeaders(),
+          body: JSON.stringify({ decision, feedback: feedback || null }),
+        },
+      );
+      if (!response.ok) throw new Error(await readApiErrorMessage(response));
+      const payload = await response.json();
+      if (payload?.project_ir) {
+        setProjectIR(withProjectResponseMetadata(payload.project_ir, payload));
+      }
+      if (decision === "revise" && feedback?.trim()) {
+        setGenerationMode("progressive");
+        setPrompt(`Revise the current concept using this feedback: ${feedback.trim()}`);
+      }
+      if (decision === "continue_to_cad" && payload?.cad_generated) {
+        setActiveTab("cad");
+      }
+      void refreshProjectAndChatLists();
+    } catch (error) {
+      setVisualDecisionError(error instanceof Error ? error.message : "Could not update the Progressive concept review.");
+    } finally {
+      setVisualDecisionBusy(null);
+    }
+  };
   const ownerProjectChatId = projectIR && currentUserOwnsProject
     ? (chatIdFromIR(projectIR) || currentProjectId)
     : null;
   const currentProjectChatId = projectIR
-    ? routedProjectId ? null : (ownerProjectChatId || activeChatId)
+    ? routedProjectId ? null : (routedChatId || ownerProjectChatId || activeChatId)
     : activeChatId;
   const currentProjectChatMessages = useMemo(
     () => currentProjectChatId ? chatThreads[currentProjectChatId] || [] : [],
     [chatThreads, currentProjectChatId]
   );
+  const projectVersionHistory: ProjectHistoryConfig = {
+    projectId: currentProjectId || "",
+    identityKey: authIdentityKey,
+    enabled: currentUserOwnsProject,
+    apiUrl: API_URL,
+    latestRevision: revisionNumber(projectIR?.assembly_metadata?.project_revision) || revisionNumber(projectIR?.assembly_metadata?.revision),
+    getHeaders: generationRequestHeaders,
+    loadLatest: (signal) => loadOldProject(currentProjectId, {
+      syncRoute: false, signal, tab: activeTab, chatId: currentProjectChatId || undefined,
+    }),
+  };
   const retryableProjectBuildMessage = useMemo(
     () => latestRetryableContextBuildMessage(currentProjectChatMessages),
     [currentProjectChatMessages],
@@ -5046,21 +5778,59 @@ export function FormaWorkspace({
       goHome();
     }
   };
-  const newChatDisabled = hostedChatReadOnly || (homeView === "chat" && !routedProjectId && !activeSidebarChatStarted);
+  const newChatDisabled = chatAccessState !== "ready" || (homeView === "chat" && !routedProjectId && !activeSidebarChatStarted);
+  const newChatDisabledReason = chatAccessState !== "ready" ? "Chat is still loading." : undefined;
   const homeChromeRef = useRef<HTMLDivElement>(null);
   const { headerAway: homeHeaderAway, bindCapture: bindHomeChromeScroll } = useChromeHeaderScroll(
     `${homeView}:${activeChatId || ""}:${activeSidebarChatStarted ? "started" : "new"}`
   );
   useEffect(() => bindHomeChromeScroll(homeChromeRef.current), [bindHomeChromeScroll, homeView, projectIR]);
-  const waitingChatIds = useMemo(() => {
-    const ids = new Set<string>();
-    Object.entries(chatThreads).forEach(([chatId, messages]) => {
-      if (chatIsWaiting(messages)) ids.add(chatId);
+  const activityThreads = useMemo(() => {
+    const threads = { ...chatThreads };
+    if (activeChatId) {
+      const byId = new Map((threads[activeChatId] || []).map((message) => [message.id, message]));
+      chatMessages.forEach((message) => byId.set(message.id, message));
+      threads[activeChatId] = [...byId.values()];
+    }
+    return threads;
+  }, [activeChatId, chatMessages, chatThreads]);
+  const activityOperations = useMemo(() => collectChatOperations(activityThreads), [activityThreads]);
+  const activityObservations = useChatActivity({
+    apiUrl: API_URL,
+    scope: chatStorageScope,
+    enabled: !authRequired || (authLoaded && isSignedIn),
+    operations: activityOperations,
+    getHeaders: generationRequestHeaders,
+  });
+  useEffect(() => {
+    // This is a local projection of confirmed outcomes. Do not overwrite server
+    // chat history merely because its status was read, including in maintenance.
+    setChatMessages((current) => settleChatActivityMessages(current, activityObservations, liveChatMessageIds));
+    setChatThreads((current) => {
+      let changed = false;
+      const next = { ...current };
+      Object.entries(current).forEach(([chatId, messages]) => {
+        const settled = settleChatActivityMessages(messages, activityObservations, liveChatMessageIds);
+        if (settled !== messages) {
+          changed = true;
+          next[chatId] = settled;
+          writeStoredChatThread(chatId, settled, chatStorageScope);
+        }
+      });
+      return changed ? next : current;
     });
-    if (activeChatId && chatIsWaiting(chatMessages)) ids.add(activeChatId);
-    if (currentProjectChatId && chatIsWaiting(currentProjectChatMessages)) ids.add(currentProjectChatId);
-    return ids;
-  }, [activeChatId, chatMessages, chatThreads, currentProjectChatId, currentProjectChatMessages]);
+  }, [activityObservations, chatStorageScope, liveChatMessageIds]);
+  const chatActivityById = useMemo(() => {
+    const activities: Record<string, ChatActivity> = {};
+    Object.entries(activityThreads).forEach(([chatId, messages]) => {
+      const activity = chatActivity(messages, activityObservations, liveChatMessageIds);
+      if (activity) activities[chatId] = activity;
+    });
+    return activities;
+  }, [activityThreads, activityObservations, liveChatMessageIds]);
+  const waitingChatIds = useMemo(() => new Set(Object.entries(chatActivityById)
+    .filter(([, activity]) => activity.state === "running")
+    .map(([chatId]) => chatId)), [chatActivityById]);
   const projectJobs = a2aJobs.filter((job) => {
     if (currentProjectJobId && job.job_id === currentProjectJobId) return true;
     if (currentProjectId && job.result_summary?.project_id === currentProjectId) return true;
@@ -5088,6 +5858,10 @@ export function FormaWorkspace({
             systemArchitecture={projectIR?.system_architecture || null}
             showModelName={formaDevMode}
             showImageSection={showProductImageSection}
+            canManageProgressiveReview={hostedChatEnabled && currentUserOwnsProject}
+            visualDecisionBusy={visualDecisionBusy}
+            visualDecisionError={visualDecisionError}
+            onVisualDecision={handleProgressiveVisualDecision}
           />
         );
       case "bom":
@@ -5103,6 +5877,7 @@ export function FormaWorkspace({
       case "mechanical":
         return (
           <MechanicalPanel
+            systemArchitecture={projectIR?.system_architecture}
             toggles={mechToggles}
             setToggles={setMechToggles}
             electricalActive={mechElectricalActive}
@@ -5111,10 +5886,11 @@ export function FormaWorkspace({
             features={imageFeatures}
             metadata={projectIR?.assembly_metadata || {}}
             mechanical={projectIR?.mechanical || {}}
+            cadModel={currentCadModel && typeof currentCadModel === "object" ? currentCadModel as Record<string, any> : null}
           />
         );
       case "cad": {
-        return <CadModelPanel cadModel={currentCadModel} />;
+        return <CadModelPanel cadModel={currentCadModel} apiUrl={API_URL} getHeaders={generationRequestHeaders} />;
       }
       case "schematic":
         return <SchematicCanvas project={schematicProject} />;
@@ -5123,11 +5899,17 @@ export function FormaWorkspace({
           <AssemblyPanel
             assembly={assembly}
             issues={issues}
-            onDownloadJSON={downloadJSONIR}
-            onDownloadMarkdown={downloadMarkdownDocs}
-            canDownloadAssets={currentProjectCanDownloadAssets}
           />
         );
+      case "exports":
+        return currentProjectId ? (
+          <ProjectExportsPanel
+            projectId={currentProjectId}
+            canDownloadAssets={currentProjectCanDownloadAssets}
+            onDownloadJSON={downloadJSONIR}
+            onDownloadMarkdown={downloadMarkdownDocs}
+          />
+        ) : null;
       case "video":
         return (
           <VideoPanel {...projectVideo} />
@@ -5168,12 +5950,71 @@ export function FormaWorkspace({
   })();
 
   useEffect(() => {
-    if (routedProjectId) return;
+    // Routed chats are hydrated by the route loader. A project's backend chat
+    // identity may differ from the browser's OpenCode conversation identity.
+    if (routedProjectId || routedChatId) return;
     if (!currentUserOwnsProject) return;
     if (!currentProjectId || currentProjectChatMessages.length) return;
-    ensureChatThread(currentProjectId, projectIR, projectIR?.assembly_metadata?.source_prompt);
+    void ensureChatThread(currentProjectId, projectIR);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [routedProjectId, currentUserOwnsProject, currentProjectId, currentProjectChatMessages.length, projectIR]);
+  }, [routedProjectId, routedChatId, currentUserOwnsProject, currentProjectId, currentProjectChatMessages.length, projectIR]);
+
+  const deliverySignatureRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!authoringMode || !currentProjectId) {
+      setDeliveredSignal(false);
+      return;
+    }
+    const token = currentProjectId;
+    let cancelled = false;
+    let pending = false;
+    deliverySignatureRef.current = null;
+
+    const signatureOf = (record: Record<string, unknown>) => {
+      const updatedAt = typeof record?.updated_at === "string" ? record.updated_at : "";
+      const contentUpdatedAt = typeof record?.content_updated_at === "string" ? record.content_updated_at : "";
+      return `${contentUpdatedAt || updatedAt}`;
+    };
+
+    const poll = async () => {
+      if (cancelled || pending) return;
+      pending = true;
+      try {
+        const response = await fetch(`${API_URL}/projects/${encodeURIComponent(token)}`, {
+          cache: "no-store",
+          headers: await optionalAuthHeaders(),
+        });
+        if (cancelled) return;
+        if (!response.ok) return;
+        const data = await response.json();
+        const signature = signatureOf(data);
+        if (!deliverySignatureRef.current) {
+          deliverySignatureRef.current = signature;
+          return;
+        }
+        if (signature && signature !== deliverySignatureRef.current) {
+          deliverySignatureRef.current = signature;
+          refreshProjectAndChatLists();
+          setDeliveredSignal(true);
+          window.setTimeout(() => {
+            if (!cancelled) setDeliveredSignal(false);
+          }, AUTHORING_DELIVERED_SIGNAL_MS);
+        }
+      } catch {
+        // Transient polling errors must not clear the tracked delivery signature.
+      } finally {
+        pending = false;
+      }
+    };
+
+    void poll();
+    const intervalId = window.setInterval(poll, AUTHORING_DELIVERY_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshProjectAndChatLists is intentionally excluded for parity with the other polling effects.
+  }, [authoringMode, currentProjectId, optionalAuthHeaders]);
 
   const implicitChatRouteTransition: ChatRouteTransition | null = routedChatId && (
     activeChatId !== routedChatId ||
@@ -5227,13 +6068,14 @@ export function FormaWorkspace({
             activeChatId={visibleChatRouteTransition.chatId}
             onNewChat={startNewProjectChat}
             newChatDisabled={newChatDisabled}
-            newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-            readOnly={hostedChatReadOnly}
+            newChatDisabledReason={newChatDisabledReason}
+             readOnly={chatReadOnly || authoringMode}
             onOpenChat={openChatItem}
             onRenameChat={renameSidebarChat}
             onPinChat={togglePinnedChat}
             onDeleteChat={deleteSidebarChat}
             waitingChatIds={waitingChatIds}
+            chatActivityById={chatActivityById}
             chatsLoading={sidebarChatsLoading}
             showJobs={canViewJobs}
             jobsPending={sidebarJobsPending}
@@ -5250,13 +6092,14 @@ export function FormaWorkspace({
             activeChatId={visibleChatRouteTransition.chatId}
             onNewChat={startNewProjectChat}
             newChatDisabled={newChatDisabled}
-            newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-            readOnly={hostedChatReadOnly}
+            newChatDisabledReason={newChatDisabledReason}
+             readOnly={chatReadOnly || authoringMode}
             onOpenChat={openChatItem}
             onRenameChat={renameSidebarChat}
             onPinChat={togglePinnedChat}
             onDeleteChat={deleteSidebarChat}
             waitingChatIds={waitingChatIds}
+            chatActivityById={chatActivityById}
             chatsLoading={sidebarChatsLoading}
             showJobs={canViewJobs}
             jobsPending={sidebarJobsPending}
@@ -5300,14 +6143,15 @@ export function FormaWorkspace({
             chats={chatListItems}
             activeChatId={null}
             onNewChat={startNewProjectChat}
-            newChatDisabled={newChatDisabled}
-            newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-            readOnly={hostedChatReadOnly}
+             newChatDisabled={newChatDisabled}
+             newChatDisabledReason={newChatDisabledReason}
+             readOnly={chatReadOnly || authoringMode}
             onOpenChat={openChatItem}
             onRenameChat={renameSidebarChat}
             onPinChat={togglePinnedChat}
             onDeleteChat={deleteSidebarChat}
             waitingChatIds={waitingChatIds}
+            chatActivityById={chatActivityById}
             chatsLoading={sidebarChatsLoading}
             showJobs={canViewJobs}
             jobsPending={sidebarJobsPending}
@@ -5323,14 +6167,15 @@ export function FormaWorkspace({
             chats={chatListItems}
             activeChatId={null}
             onNewChat={startNewProjectChat}
-            newChatDisabled={newChatDisabled}
-            newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-            readOnly={hostedChatReadOnly}
+             newChatDisabled={newChatDisabled}
+             newChatDisabledReason={newChatDisabledReason}
+             readOnly={chatReadOnly || authoringMode}
             onOpenChat={openChatItem}
             onRenameChat={renameSidebarChat}
             onPinChat={togglePinnedChat}
             onDeleteChat={deleteSidebarChat}
             waitingChatIds={waitingChatIds}
+            chatActivityById={chatActivityById}
             chatsLoading={sidebarChatsLoading}
             showJobs={canViewJobs}
             jobsPending={sidebarJobsPending}
@@ -5374,16 +6219,17 @@ export function FormaWorkspace({
             onToggle={() => setSidebarCollapsed((value) => !value)}
             onHome={goHome}
             chats={chatListItems}
-            activeChatId={activeChatId}
+             activeChatId={activeChatId}
             onNewChat={startNewProjectChat}
             newChatDisabled={newChatDisabled}
-            newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-            readOnly={hostedChatReadOnly}
+            newChatDisabledReason={newChatDisabledReason}
+             readOnly={chatReadOnly || authoringMode}
             onOpenChat={openChatItem}
             onRenameChat={renameSidebarChat}
             onPinChat={togglePinnedChat}
             onDeleteChat={deleteSidebarChat}
             waitingChatIds={waitingChatIds}
+            chatActivityById={chatActivityById}
             chatsLoading={sidebarChatsLoading}
             showJobs={canViewJobs}
             jobsPending={sidebarJobsPending}
@@ -5397,16 +6243,17 @@ export function FormaWorkspace({
             onToggle={() => setSidebarCollapsed((value) => !value)}
             onHome={goHome}
             chats={chatListItems}
-            activeChatId={activeChatId}
+             activeChatId={activeChatId}
             onNewChat={startNewProjectChat}
             newChatDisabled={newChatDisabled}
-            newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-            readOnly={hostedChatReadOnly}
+            newChatDisabledReason={newChatDisabledReason}
+             readOnly={chatReadOnly || authoringMode}
             onOpenChat={openChatItem}
             onRenameChat={renameSidebarChat}
             onPinChat={togglePinnedChat}
             onDeleteChat={deleteSidebarChat}
             waitingChatIds={waitingChatIds}
+            chatActivityById={chatActivityById}
             chatsLoading={sidebarChatsLoading}
             showJobs={canViewJobs}
             jobsPending={sidebarJobsPending}
@@ -5436,7 +6283,7 @@ export function FormaWorkspace({
               title={(
                 <EditableWorkspaceTitle
                   value={activeSidebarChatItem?.title || NEW_PROJECT_TITLE}
-                  canEdit={hostedChatEnabled}
+                   canEdit={hostedChatEnabled && !authoringMode}
                   label="Chat title"
                   onCommit={(title) => {
                     if (activeChatId) {
@@ -5461,6 +6308,7 @@ export function FormaWorkspace({
                 sectionRef={projectsSectionRef}
                 projects={projectBrowserItems}
                 title="Community"
+                pageSize={PROJECT_GALLERY_PAGE_SIZE}
                 loading={projectsPageLoading}
                 onOpenProject={(projectId) => router.push(projectRoute(projectId))}
                 onToggleSave={canInteractWithGallery ? (project) => {
@@ -5472,7 +6320,8 @@ export function FormaWorkspace({
                   return item ? handleRemixProject(item) : undefined;
                 } : undefined}
                 onVisibleProjectIdsChange={handleVisibleProjectGalleryIdsChange}
-                totalItems={projectHistoryTotal}
+                totalItems={visibleProjectTotal}
+                error={hasCurrentGalleryPage && !visibleProjectHistory.length ? projectHistoryError : null}
                 currentPage={projectHistoryPage}
                 onPageChange={handleProjectHistoryPageChange}
                 searchValue={projectSearchInput}
@@ -5483,6 +6332,7 @@ export function FormaWorkspace({
                 sectionRef={projectsSectionRef}
                 projects={myProjectBrowserItems}
                 title="My projects"
+                pageSize={PROJECT_GALLERY_PAGE_SIZE}
                 loading={myProjectsPageLoading}
                 onOpenProject={(projectId) => router.push(projectRoute(projectId))}
                 onToggleSave={canInteractWithGallery ? (project) => {
@@ -5497,6 +6347,9 @@ export function FormaWorkspace({
                 totalItems={myProjectHistoryTotal}
                 currentPage={myProjectHistoryPage}
                 onPageChange={handleMyProjectHistoryPageChange}
+                searchValue={myProjectSearchInput}
+                onSearchValueChange={setMyProjectSearchInput}
+                error={myProjectHistoryError}
               />
           ) : homeView === "jobs" ? (
             <>
@@ -5558,16 +6411,19 @@ export function FormaWorkspace({
             <UserIntegrationsPage embedded />
           ) : homeView === "about" ? (
             <AboutView />
+          ) : chatAccessState !== "ready" ? (
+            <ChatAccessStatus status={chatAccessState} onRetry={() => { void fetchRuntimeConfig(); }} />
           ) : (
             <HomeChatView
               started={activeSidebarChatStarted}
-              readOnly={hostedChatReadOnly}
+              readOnly={chatReadOnly}
+              authoringActive={authoringMode}
               conversationKey={activeChatId || "new-chat"}
               workspaceTitle={
                 activeSidebarChatStarted ? (
                   <EditableWorkspaceTitle
                     value={activeSidebarChatItem?.title || NEW_PROJECT_TITLE}
-                    canEdit={hostedChatEnabled}
+                     canEdit={hostedChatEnabled && !authoringMode}
                     label="Chat title"
                     onCommit={(title) => {
                       if (activeChatId) {
@@ -5582,14 +6438,16 @@ export function FormaWorkspace({
               }
               messages={chatMessages}
               renderPipelineProgress={renderConversationPipelineProgress}
+              projectArtifactId={inlineChatProjectId}
+              history={projectVersionHistory}
               projectArtifact={
                 projectIR && inlineChatProjectId && currentProjectId === inlineChatProjectId
                   ? (
                     <ChatProjectArtifact
                       projectId={currentProjectId}
                       projectTitle={projectTitle}
-                      canEdit={hostedChatEnabled && currentUserOwnsProject}
-                      onRenameTitle={hostedChatEnabled && currentUserOwnsProject ? (title) => { void commitOwnedWorkspaceTitle(title); } : undefined}
+                       canEdit={hostedChatEnabled && !authoringMode && currentUserOwnsProject}
+                       onRenameTitle={hostedChatEnabled && !authoringMode && currentUserOwnsProject ? (title) => { void commitOwnedWorkspaceTitle(title); } : undefined}
                       namespaceTabs={visibleWorkspaceTabs}
                       activeNamespace={activeWorkspaceTab.id}
                       onNamespaceChange={setActiveTab}
@@ -5604,8 +6462,10 @@ export function FormaWorkspace({
                 setPendingHumanContext(null);
                 setPrompt(example);
               }}
-              onSubmit={handleGatherContext}
-              canBuildNow={hostedChatEnabled && (() => {
+              generationMode={generationMode}
+              onGenerationModeChange={setGenerationMode}
+              onSubmit={authoringMode || selectedDocument ? handleGatherContext : generationMode === "regular" ? handleGenerate : handleGatherContext}
+              canBuildNow={generationMode === "progressive" && hostedChatEnabled && (() => {
                 const messages = activeChatId ? chatThreads[activeChatId] || chatMessages : chatMessages;
                 const contextMessage = [...messages].reverse().find((message) => Boolean(message.contextProjectId));
                 const state = contextWorkflowStates[activeChatId]
@@ -5618,27 +6478,32 @@ export function FormaWorkspace({
               onSelectContextSuggestion={(suggestion) => {
                 void submitGatherContext(suggestion);
               }}
-              isLoading={hostedChatEnabled && (contextSubmitting || Boolean(activeGeneration || pendingContextBuildMessage || resettingBuildMessageId))}
+               isLoading={(hostedChatEnabled || authoringMode) && (contextSubmitting || Boolean(activeGeneration || pendingContextBuildMessage || resettingBuildMessageId))}
               generationReady
               needsGenerationProvider={false}
               needsImageProvider={false}
               selectedImage={selectedImage}
+              selectedDocumentName={selectedDocument?.name || null}
               onRemoveImage={removeSelectedImage}
+              onRemoveDocument={removeSelectedDocument}
               notice={visibleContextInputNotice}
               prompt={prompt}
               onPromptChange={(value) => {
                 setGenerationInputNotice(null);
                 setPrompt(value);
               }}
-              generationActive={hostedChatEnabled && Boolean(activeGeneration || pendingContextBuildMessage)}
+               generationActive={(hostedChatEnabled || authoringMode) && Boolean(activeGeneration || pendingContextBuildMessage)}
               onStop={() => {
-                if (activeGenerationRef.current) stopActiveGeneration();
+                if (generationRunsRef.current.has(activeChatId)) stopActiveGeneration();
                 else if (pendingContextBuildMessage) stopContextBuildMessage(pendingContextBuildMessage);
               }}
-              canRetryFailedBuild={hostedChatEnabled && Boolean(retryableContextBuildMessage)}
+              retryLabel={pendingOpenCodeMessage(activeChatId) ? "Check request status" : undefined}
+                canRetryFailedBuild={Boolean(pendingOpenCodeMessage(activeChatId)) || Boolean(openCodeRetries[activeChatId]) || (hostedChatEnabled && Boolean(retryableContextBuildMessage))}
               retryingFailedBuild={hostedChatEnabled && resettingBuildMessageId === retryableContextBuildMessage?.id}
               onRetryFailedBuild={() => {
-                if (retryableContextBuildMessage) void resetFailedContextBuild(retryableContextBuildMessage);
+                if (pendingOpenCodeMessage(activeChatId)) checkOpenCodeStatus(activeChatId);
+                else if (openCodeRetries[activeChatId]) void submitOpenCodeTurn({ chatId: activeChatId, ...openCodeRetries[activeChatId] });
+                else if (retryableContextBuildMessage) void resetFailedContextBuild(retryableContextBuildMessage);
               }}
               hasGenerationInput={hasGenerationInput}
               inputValid={generationInputValidation.isValid}
@@ -5676,16 +6541,17 @@ export function FormaWorkspace({
           onToggle={() => setSidebarCollapsed((value) => !value)}
           onHome={goHome}
           chats={chatListItems}
-          activeChatId={activeSidebarChatId}
+           activeChatId={activeSidebarChatId}
           onNewChat={startNewProjectChat}
           newChatDisabled={newChatDisabled}
-          newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-          readOnly={hostedChatReadOnly}
+          newChatDisabledReason={newChatDisabledReason}
+                 readOnly={hostedChatReadOnly || authoringMode}
           onOpenChat={openChatItem}
           onRenameChat={renameSidebarChat}
           onPinChat={togglePinnedChat}
           onDeleteChat={deleteSidebarChat}
           waitingChatIds={waitingChatIds}
+          chatActivityById={chatActivityById}
           chatsLoading={sidebarChatsLoading}
           showJobs={canViewJobs}
           jobsPending={sidebarJobsPending}
@@ -5702,13 +6568,14 @@ export function FormaWorkspace({
           activeChatId={activeSidebarChatId}
           onNewChat={startNewProjectChat}
           newChatDisabled={newChatDisabled}
-          newChatDisabledReason={hostedChatReadOnly ? HOSTED_CHAT_MAINTENANCE_MESSAGE : undefined}
-          readOnly={hostedChatReadOnly}
+          newChatDisabledReason={newChatDisabledReason}
+           readOnly={chatReadOnly || authoringMode}
           onOpenChat={openChatItem}
           onRenameChat={renameSidebarChat}
           onPinChat={togglePinnedChat}
           onDeleteChat={deleteSidebarChat}
           waitingChatIds={waitingChatIds}
+          chatActivityById={chatActivityById}
           chatsLoading={sidebarChatsLoading}
           showJobs={canViewJobs}
           jobsPending={sidebarJobsPending}
@@ -5727,41 +6594,61 @@ export function FormaWorkspace({
         />
 
           <section className="min-h-0 min-w-0 flex-1 overflow-hidden">
-            {routedProjectId ? (
+            {routedProjectId || isPublicExample ? (
               <ProjectDetailWorkspace
+                history={projectVersionHistory}
                 onOpenSidebar={() => setMobileSidebarOpen(true)}
                 projectId={currentProjectId}
                 projectTitle={projectTitle}
+                isPrivate={currentProjectPrivate}
                 owned={currentUserOwnsProject}
-                readOnly={hostedChatReadOnly}
-                onRenameTitle={hostedChatEnabled && currentUserOwnsProject ? (title) => { void commitOwnedWorkspaceTitle(title); } : undefined}
+                readOnly={hostedChatReadOnly || authoringMode}
+                 onRenameTitle={hostedChatEnabled && !authoringMode && currentUserOwnsProject ? (title) => { void commitOwnedWorkspaceTitle(title); } : undefined}
                 namespaceTabs={visibleWorkspaceTabs}
                 activeNamespace={activeWorkspaceTab.id}
                 onNamespaceChange={setActiveTab}
                 projectContent={projectNamespaceContent}
               />
+            ) : chatAccessState !== "ready" ? (
+              <ChatAccessStatus status={chatAccessState} onRetry={() => { void fetchRuntimeConfig(); }} />
             ) : (
               <ChatWorkspace
+                history={projectVersionHistory}
                 onOpenSidebar={() => setMobileSidebarOpen(true)}
                 projectId={currentProjectId}
                 chatId={currentProjectChatId}
                 projectTitle={projectTitle}
-                onRenameTitle={hostedChatEnabled && currentUserOwnsProject ? (title) => { void commitOwnedWorkspaceTitle(title); } : undefined}
+                isPrivate={currentProjectPrivate}
+                 onRenameTitle={hostedChatEnabled && !authoringMode && currentUserOwnsProject ? (title) => { void commitOwnedWorkspaceTitle(title); } : undefined}
                 messages={currentProjectChatMessages}
                 renderPipelineProgress={renderConversationPipelineProgress}
                 input={projectChatInput}
                 setInput={setProjectChatInput}
                 onSubmit={handleProjectChatGenerate}
-                isLoading={hostedChatEnabled && isLoading}
-                canStop={hostedChatEnabled && activeGeneration?.kind === "project-chat"}
-                onStop={stopActiveGeneration}
-                canRetryFailedBuild={hostedChatEnabled && Boolean(retryableProjectBuildMessage)}
+                attachmentControls={{
+                  imageInputRef: fileInputRefSidebar,
+                  onImageChange: handleImageChange,
+                  selectedImage,
+                  selectedDocumentName: selectedDocument?.name || null,
+                  onRemoveImage: removeSelectedImage,
+                  onRemoveDocument: removeSelectedDocument,
+                }}
+                onImagePaste={handleImagePaste}
+                notice={generationInputNotice}
+                 isLoading={(hostedChatEnabled || authoringMode) && (isLoading || contextSubmitting || Boolean(generationRuns[currentProjectChatId]))}
+                 canStop={(hostedChatEnabled || authoringMode) && generationRuns[currentProjectChatId]?.kind === "project-chat"}
+                onStop={() => stopActiveGeneration(currentProjectChatId)}
+                retryLabel={pendingOpenCodeMessage(currentProjectChatId) ? "Check request status" : undefined}
+                canRetryFailedBuild={Boolean(pendingOpenCodeMessage(currentProjectChatId)) || Boolean(openCodeRetries[currentProjectChatId]) || (hostedChatEnabled && Boolean(retryableProjectBuildMessage))}
                 retryingFailedBuild={hostedChatEnabled && resettingBuildMessageId === retryableProjectBuildMessage?.id}
                 onRetryFailedBuild={() => {
-                  if (retryableProjectBuildMessage) void resetFailedContextBuild(retryableProjectBuildMessage);
+                  if (pendingOpenCodeMessage(currentProjectChatId)) checkOpenCodeStatus(currentProjectChatId);
+                else if (openCodeRetries[currentProjectChatId]) void submitOpenCodeTurn({ chatId: currentProjectChatId, ...openCodeRetries[currentProjectChatId] });
+                  else if (retryableProjectBuildMessage) void resetFailedContextBuild(retryableProjectBuildMessage);
                 }}
-                canChat={hostedChatEnabled && currentUserOwnsProject}
-                readOnly={hostedChatReadOnly}
+                 canChat={(hostedChatEnabled || authoringMode) && currentUserOwnsProject}
+                 readOnly={chatReadOnly}
+                authoringActive={authoringMode}
                 namespaceTabs={visibleWorkspaceTabs}
                 activeNamespace={activeWorkspaceTab.id}
                 activeNamespaceLabel={activeWorkspaceTab.label}
@@ -5893,7 +6780,8 @@ function buildChatListItems(projectHistory: any[], localChatItems: ChatListItem[
     .filter((project: any) => project?.project_id)
     .forEach((project: any) => {
       const projectId = String(project.project_id);
-      const chatId = String(project.chat_id || projectId).trim();
+      const conversation = localChatItems.find((item) => item.projectId === projectId);
+      const chatId = String(conversation?.chatId || project.chat_id || projectId).trim();
       if (!chatId) return;
 
       const existing = groups.get(chatId);
@@ -6000,26 +6888,6 @@ function mergeProjectRecords(primary: any[], secondary: any[]): any[] {
 
 function sameStringList(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function projectRecordsFromChatItems(chatItems: ChatListItem[]): any[] {
-  return chatItems
-    .filter((item) => item.projectId)
-    .map((item) => ({
-      project_id: item.projectId,
-      chat_id: item.chatId,
-      title: item.title || "Untitled project",
-      prompt: item.title || "",
-      created_at: item.createdAt || chatTimestamp(),
-      can_chat: true,
-      creator_display: "unknown",
-      creator_username: "unknown",
-      creator_image_url: null,
-      parts_count: 0,
-      save_count: 0,
-      remix_count: 0,
-      saved: false,
-    }));
 }
 
 function WorkspaceChromeIdentity({
@@ -6412,7 +7280,7 @@ function VideoPanel({
               <div className="mt-5 rounded-lg border border-[var(--forma-border)] bg-[var(--forma-surface-muted)] p-3 text-xs leading-5 text-[var(--forma-text-secondary)]">
                 {canOpenAssets
                   ? "Video generation and review are unavailable during hosted chat maintenance. Saved videos remain available for viewing."
-                  : "Read-only project. Video actions are available only to the owner."}
+                  : "Video actions are available only to the owner."}
               </div>
             )}
 
@@ -6501,7 +7369,7 @@ function VideoPanel({
             <div className="mb-5 rounded-lg border border-[var(--forma-border)] bg-[var(--forma-surface-muted)] p-3 text-xs leading-5 text-[var(--forma-text-secondary)]">
               {canOpenAssets
                 ? "Video generation and review are unavailable during hosted chat maintenance. Saved videos remain available for viewing."
-                : "Read-only project. Video actions are available only to the owner."}
+                : "Video actions are available only to the owner."}
             </div>
           )}
 
@@ -6675,7 +7543,14 @@ function VideoPanel({
                         aria-pressed={selected}
                       >
                         <div className="relative h-20 overflow-hidden rounded-md bg-[var(--forma-surface-muted)]">
-                          <img src={candidate.src} alt={candidate.label} className="h-full w-full object-cover" />
+                          <Image
+                            src={candidate.src}
+                            alt={candidate.label}
+                            width={1}
+                            height={1}
+                            unoptimized
+                            className="h-full w-full object-cover"
+                          />
                           <span className={`absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded-md border text-[10px] font-medium ${
                             selected
                               ? "border-[rgb(var(--forma-cyan-rgb))] bg-[rgb(var(--forma-cyan-rgb))] text-[var(--forma-page)]"
@@ -6745,8 +7620,14 @@ function VideoPanel({
             {mode === "video-to-video" && sourceVideoPreview ? (
               <video src={sourceVideoPreview} controls preload="metadata" className="h-full w-full object-contain" />
             ) : imagePreview ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={imagePreview} alt="Video source preview" className="h-full w-full object-contain" />
+              <Image
+                src={imagePreview}
+                alt="Video source preview"
+                width={1}
+                height={1}
+                unoptimized
+                className="h-full w-full object-contain"
+              />
             ) : (
               <div className="flex h-full items-center justify-center text-[11px] font-medium uppercase tracking-[0.14em] text-[var(--forma-text-muted)]">
                 No source
@@ -7056,9 +7937,11 @@ function VideoGalleryItem({
 }
 
 function ProjectDetailWorkspace({
+  history,
   onOpenSidebar,
   projectId,
   projectTitle,
+  isPrivate,
   owned,
   readOnly,
   onRenameTitle,
@@ -7067,9 +7950,11 @@ function ProjectDetailWorkspace({
   onNamespaceChange,
   projectContent,
 }: {
+  history: ProjectHistoryConfig;
   onOpenSidebar: () => void;
   projectId: string | null;
   projectTitle: string;
+  isPrivate: boolean;
   owned: boolean;
   readOnly: boolean;
   onRenameTitle?: (title: string) => void;
@@ -7079,64 +7964,49 @@ function ProjectDetailWorkspace({
   projectContent: React.ReactNode;
 }) {
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--forma-page)]">
-      <header className="workspace-chrome-header flex min-h-14 min-w-0 items-center gap-3 overflow-hidden px-3 pb-5 pt-2 sm:px-4">
-        <MobileSidebarButton onClick={onOpenSidebar} />
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[rgb(var(--forma-green-rgb)/0.12)] px-2 py-0.5 text-[10px] font-medium text-[rgb(var(--forma-green-rgb))]">
-              <Eye className="h-3 w-3" />
-              {owned ? "Your project" : "Public project"}
-            </span>
-            <EditableWorkspaceTitle
-              value={projectTitle}
-              canEdit={!readOnly && owned && Boolean(onRenameTitle)}
-              label="Project title"
-              onCommit={(title) => onRenameTitle?.(title)}
-            />
-          </div>
-        </div>
-      </header>
-
-      {readOnly && (
-        <div className="px-3 pt-3 sm:px-4">
-          <HostedChatMaintenance compact />
-        </div>
-      )}
-
-      <section className="min-h-0 min-w-0 flex-1 overflow-hidden bg-[var(--forma-page)]" aria-label="Project workspace">
-        <ProjectWorkspacePanel
-          projectId={projectId}
-          namespaceTabs={namespaceTabs}
-          activeNamespace={activeNamespace}
-          onNamespaceChange={onNamespaceChange}
-        >
-          {projectContent}
-        </ProjectWorkspacePanel>
-      </section>
-    </div>
+    <ProjectHistoryProvider config={history}>
+      <ChatProjectArtifact
+        projectId={projectId}
+        projectTitle={projectTitle}
+        isPrivate={isPrivate}
+        canEdit={!readOnly && owned}
+        onRenameTitle={onRenameTitle}
+        namespaceTabs={namespaceTabs}
+        activeNamespace={activeNamespace}
+        onNamespaceChange={onNamespaceChange}
+        projectContent={projectContent}
+        leading={<MobileSidebarButton onClick={onOpenSidebar} />}
+      />
+    </ProjectHistoryProvider>
   );
 }
 
 function ChatWorkspace({
+  history,
   onOpenSidebar,
   projectId,
   chatId,
   projectTitle,
+  isPrivate,
   onRenameTitle,
   messages,
   renderPipelineProgress,
   input,
   setInput,
   onSubmit,
+  attachmentControls,
+  onImagePaste,
+  notice,
   isLoading,
   canStop,
   onStop,
   canRetryFailedBuild,
+  retryLabel = "Try failed build again",
   retryingFailedBuild,
   onRetryFailedBuild,
   canChat,
   readOnly,
+  authoringActive = false,
   namespaceTabs,
   activeNamespace,
   activeNamespaceLabel,
@@ -7144,24 +8014,31 @@ function ChatWorkspace({
   onNamespaceChange,
   projectContent,
 }: {
+  history: ProjectHistoryConfig;
   onOpenSidebar: () => void;
   projectId: string | null;
   chatId: string | null;
   projectTitle: string;
+  isPrivate: boolean;
   onRenameTitle?: (title: string) => void;
   messages: ChatMessage[];
   renderPipelineProgress: (message: ConversationMessage) => React.ReactNode;
   input: string;
   setInput: (value: string) => void;
   onSubmit: (event: React.FormEvent) => void;
+  attachmentControls: ChatAttachmentControls;
+  onImagePaste: React.ClipboardEventHandler<HTMLTextAreaElement>;
+  notice: string | null;
   isLoading: boolean;
   canStop: boolean;
   onStop: () => void;
   canRetryFailedBuild: boolean;
+  retryLabel?: string;
   retryingFailedBuild: boolean;
   onRetryFailedBuild: () => void;
   canChat: boolean;
   readOnly: boolean;
+  authoringActive?: boolean;
   namespaceTabs: typeof workspaceTabs;
   activeNamespace: string;
   activeNamespaceLabel: string;
@@ -7172,18 +8049,18 @@ function ChatWorkspace({
   const { containerRef, endRef, handleScroll } = useChatAutoScroll(chatId || projectId || "project-chat", messages);
   const { headerAway, updateFromContainer } = useChromeHeaderScroll(chatId || projectId || "project-chat");
   const chatAvailable = canChat && !readOnly;
-  const hasInput = Boolean(input.trim());
+  const hasInput = Boolean(input.trim() || attachmentControls.selectedImage || attachmentControls.selectedDocumentName);
   const retryMode = shouldOfferFailedBuildRetry({
     canRetryFailedBuild: canRetryFailedBuild && !readOnly,
     hasInput,
     generationActive: canStop,
   });
   const primaryActionLabel = readOnly
-    ? "Hosted chat is read-only during maintenance"
+    ? "Hosted chat is temporarily under maintenance"
     : canStop
       ? "Stop project update"
       : retryMode
-        ? "Try failed build again"
+        ? retryLabel
         : "Apply change to project, or press Enter";
 
   const onChatScroll = () => {
@@ -7192,6 +8069,24 @@ function ChatWorkspace({
   };
 
   return (
+    <ChatProjectLayout
+      history={history}
+      conversationKey={chatId || projectId || "project-chat"}
+      projectId={projectId}
+      project={(chatAvailable || readOnly) && projectId ? (
+                <ChatProjectArtifact
+                  projectId={projectId}
+                  projectTitle={projectTitle}
+                  isPrivate={isPrivate}
+                  canEdit={chatAvailable && Boolean(onRenameTitle)}
+                  onRenameTitle={chatAvailable ? onRenameTitle : undefined}
+                  namespaceTabs={namespaceTabs}
+                  activeNamespace={activeNamespace}
+                  onNamespaceChange={onNamespaceChange}
+                  projectContent={projectContent}
+                />
+      ) : null}
+    >
     <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--forma-page)]">
       <header className={`workspace-chrome-header absolute inset-x-0 top-0 z-20 flex min-h-14 min-w-0 items-center gap-3 px-3 pb-5 pt-2 sm:px-4 ${headerAway ? "is-away" : ""}`}>
         <MobileSidebarButton onClick={onOpenSidebar} />
@@ -7199,7 +8094,11 @@ function ChatWorkspace({
           <div className="flex min-w-0 items-center gap-2">
             <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[rgb(var(--forma-green-rgb)/0.12)] px-2 py-0.5 text-[10px] font-medium text-[rgb(var(--forma-green-rgb))]">
               {chatAvailable ? <MessageSquare className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-              {chatAvailable ? "Project chat" : readOnly ? "Read-only during maintenance" : "Read-only project"}
+              {authoringActive
+                ? "FormaAgent authoring"
+                : chatAvailable
+                  ? "Project chat"
+                  : "Project"}
             </span>
             <EditableWorkspaceTitle
               value={projectTitle}
@@ -7221,33 +8120,30 @@ function ChatWorkspace({
             >
               <div className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-3">
                 {readOnly && <HostedChatMaintenance compact />}
+                {authoringActive && <AuthoringModeBanner compact />}
                 <ConversationMessageList
                   messages={messages}
                   renderPipelineProgress={renderPipelineProgress}
                   variant="project"
-                  emptyMessage="This chat has no project messages yet."
-                  isLoading={readOnly ? false : isLoading}
+                   emptyMessage="This chat has no project messages yet."
+                   isLoading={readOnly ? false : isLoading}
+                   assistantLabel={authoringActive ? "OpenCode" : "Forma"}
                 />
                 <div ref={endRef} />
-                <ChatProjectArtifact
-                  projectId={projectId}
-                  projectTitle={projectTitle}
-                  canEdit={chatAvailable && Boolean(onRenameTitle)}
-                  onRenameTitle={chatAvailable ? onRenameTitle : undefined}
-                  namespaceTabs={namespaceTabs}
-                  activeNamespace={activeNamespace}
-                  onNamespaceChange={onNamespaceChange}
-                  projectContent={projectContent}
-                />
+
               </div>
             </div>
 
             {chatAvailable && (
               <form onSubmit={onSubmit} className="shrink-0 border-t border-white/5 bg-[#0f1117]/95 p-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur sm:p-4">
               <div className="mx-auto max-w-3xl">
+                {notice && <div id="project-input-notice" role="status" className="mb-3 rounded-lg border border-amber-300/30 bg-amber-300/10 px-3 py-2 text-xs leading-5 text-amber-100">{notice.replace(/\bOpenCode\b/g, "Forma Agent")}</div>}
                 <div className="w-full rounded-2xl border border-white/5 bg-[#181b22] p-3 shadow-lg transition-all focus-within:border-emerald-500/50 focus-within:ring-1 focus-within:ring-emerald-500/20">
+                  <ChatAttachmentSelection {...attachmentControls} />
                   <textarea
                     value={input}
+                    onPaste={onImagePaste}
+                    aria-describedby={notice ? "project-input-notice" : undefined}
                     onChange={(event) => setInput(event.target.value)}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && !event.shiftKey) {
@@ -7260,10 +8156,13 @@ function ChatWorkspace({
                         event.currentTarget.form?.requestSubmit();
                       }
                     }}
+                    aria-label={`Describe a change to ${activeNamespaceLabel.toLowerCase()}`}
                     placeholder={`Describe a change to ${activeNamespaceLabel.toLowerCase()}...`}
                     className="min-h-[72px] w-full resize-none border-none bg-transparent text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500"
                   />
-                  <div className="mt-1 flex items-center justify-end gap-1.5">
+                  <div className="mt-1 flex items-center justify-between gap-1.5">
+                    <ChatAttachmentButton imageInputRef={attachmentControls.imageInputRef} />
+                    <div className="flex items-center gap-1.5">
                     {!canStop && !retryMode && !isLoading && hasInput && (
                       <span className="prompt-composer-enter-hint hidden sm:inline" aria-hidden="true">
                         Enter
@@ -7271,7 +8170,11 @@ function ChatWorkspace({
                     )}
                     <button
                       type={canStop || retryMode ? "button" : "submit"}
-                      onClick={canStop ? onStop : retryMode ? onRetryFailedBuild : undefined}
+                      onClick={canStop || retryMode ? (event) => {
+                        event.preventDefault();
+                        if (canStop) onStop();
+                        else onRetryFailedBuild();
+                      } : undefined}
                       disabled={retryMode ? retryingFailedBuild : !canStop && (isLoading || !projectId || !hasInput)}
                       className={`prompt-composer-send inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed ${
                         retryMode || (!canStop && !isLoading && hasInput) ? "is-ready" : ""
@@ -7289,6 +8192,7 @@ function ChatWorkspace({
                         <ArrowRight className="h-4 w-4" />
                       )}
                     </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -7311,155 +8215,61 @@ function ChatWorkspace({
         )}
       </div>
     </div>
+    </ChatProjectLayout>
   );
-}
-
-function scrollableVerticalParent(node: HTMLElement | null) {
-  let current = node?.parentElement || null;
-  while (current) {
-    const overflowY = window.getComputedStyle(current).overflowY;
-    if (/(auto|scroll)/.test(overflowY) && current.scrollHeight > current.clientHeight) return current;
-    current = current.parentElement;
-  }
-  return null;
 }
 
 function ChatProjectArtifact({
   projectId,
   projectTitle,
+  isPrivate = false,
   canEdit = false,
   onRenameTitle,
   namespaceTabs,
   activeNamespace,
   onNamespaceChange,
   projectContent,
+  leading,
 }: {
   projectId: string | null;
   projectTitle: string;
+  isPrivate?: boolean;
   canEdit?: boolean;
   onRenameTitle?: (title: string) => void;
   namespaceTabs: typeof workspaceTabs;
   activeNamespace: string;
   onNamespaceChange: (namespaceId: string) => void;
   projectContent: React.ReactNode;
+  leading?: React.ReactNode;
 }) {
-  const [fullScreen, setFullScreen] = useState(false);
-  const artifactRef = useRef<HTMLElement>(null);
-  const chatScrollSnapshotRef = useRef<{
-    element: HTMLElement | null;
-    top: number;
-    left: number;
-    windowX: number;
-    windowY: number;
-  } | null>(null);
-  const restoreChatScrollRef = useRef(false);
-
-  const enterFullScreen = () => {
-    const element = scrollableVerticalParent(artifactRef.current);
-    chatScrollSnapshotRef.current = {
-      element,
-      top: element?.scrollTop || 0,
-      left: element?.scrollLeft || 0,
-      windowX: window.scrollX,
-      windowY: window.scrollY,
-    };
-    setFullScreen(true);
-  };
-
-  const exitFullScreen = () => {
-    restoreChatScrollRef.current = true;
-    setFullScreen(false);
-  };
-
-  useLayoutEffect(() => {
-    if (fullScreen || !restoreChatScrollRef.current) return;
-    restoreChatScrollRef.current = false;
-    const snapshot = chatScrollSnapshotRef.current;
-    if (!snapshot) return;
-
-    const restoreScroll = () => {
-      if (snapshot.element?.isConnected) {
-        snapshot.element.scrollTo({ top: snapshot.top, left: snapshot.left, behavior: "auto" });
-      } else {
-        window.scrollTo({ top: snapshot.windowY, left: snapshot.windowX, behavior: "auto" });
-      }
-    };
-
-    restoreScroll();
-    const frameId = window.requestAnimationFrame(restoreScroll);
-    return () => window.cancelAnimationFrame(frameId);
-  }, [fullScreen]);
-
-  useEffect(() => {
-    if (!fullScreen) return;
-    const previousOverflow = document.body.style.overflow;
-    const exitOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        restoreChatScrollRef.current = true;
-        setFullScreen(false);
-      }
-    };
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", exitOnEscape);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", exitOnEscape);
-    };
-  }, [fullScreen]);
-
+  const history = useProjectHistory();
+  const viewingSnapshot = Boolean(history?.selection);
   return (
-    <section
-      ref={artifactRef}
-      className={`min-w-0 overflow-hidden bg-[var(--forma-page)] ${
-        fullScreen
-          ? "fixed inset-0 z-[80] flex h-[100dvh] w-screen flex-col"
-          : "mx-auto mt-3 w-full max-w-6xl rounded-xl border border-[var(--forma-border)]"
-      }`}
-      aria-labelledby="chat-project-title"
+    <ChatProjectSurface
+      leading={leading}
+      projectId={projectId}
+      shareTitle={projectTitle}
+      isPrivate={isPrivate}
+      title={(
+        <EditableWorkspaceTitle
+          value={history?.selection?.snapshot?.title || projectTitle}
+          canEdit={!viewingSnapshot && canEdit && Boolean(onRenameTitle)}
+          label="Project title"
+          element="div"
+          className="truncate text-xs font-semibold text-[var(--forma-text-strong)]"
+          onCommit={(title) => onRenameTitle?.(title)}
+        />
+      )}
     >
-      <header className="flex min-h-[56px] min-w-0 shrink-0 items-center justify-between gap-3 border-b border-[var(--forma-border)] bg-[var(--forma-surface)] px-4 py-2.5">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <Layers className="h-3.5 w-3.5 shrink-0 text-[rgb(var(--forma-green-rgb))]" />
-            <h3 id="chat-project-title" className="truncate text-[10px] font-medium text-[var(--forma-text-muted)]">
-              Project
-            </h3>
-          </div>
-          <EditableWorkspaceTitle
-            value={projectTitle}
-            canEdit={canEdit && Boolean(onRenameTitle)}
-            label="Project title"
-            element="div"
-            className="mt-0.5 truncate text-xs font-semibold text-[var(--forma-text-strong)]"
-            onCommit={(title) => onRenameTitle?.(title)}
-          />
-        </div>
-        <div className="flex min-w-0 items-center justify-end">
-          <button
-            type="button"
-            onClick={fullScreen ? exitFullScreen : enterFullScreen}
-            className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--forma-border)] px-2.5 text-xs font-medium text-[var(--forma-text-body)] transition-colors hover:bg-[var(--forma-surface-muted)] hover:text-[var(--forma-text-strong)] sm:px-3"
-            aria-pressed={fullScreen}
-            aria-label={fullScreen ? "Exit project full screen" : "View project full screen"}
-            title={fullScreen ? "Exit full screen (Esc)" : "Full screen"}
-          >
-            {fullScreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
-            <span className="hidden md:inline">{fullScreen ? "Exit full screen" : "Full screen"}</span>
-          </button>
-        </div>
-      </header>
-
-      <div className={fullScreen ? "min-h-0 min-w-0 flex-1 overflow-hidden" : "h-[70dvh] min-h-[540px] max-h-[820px] min-w-0 overflow-hidden"}>
-        <ProjectWorkspacePanel
-          projectId={projectId}
-          namespaceTabs={namespaceTabs}
-          activeNamespace={activeNamespace}
-          onNamespaceChange={onNamespaceChange}
-        >
-          {projectContent}
-        </ProjectWorkspacePanel>
-      </div>
-    </section>
+      {viewingSnapshot ? <ProjectRevisionPreview /> : <ProjectWorkspacePanel
+        projectId={projectId}
+        namespaceTabs={namespaceTabs}
+        activeNamespace={activeNamespace}
+        onNamespaceChange={onNamespaceChange}
+      >
+        {projectContent}
+      </ProjectWorkspacePanel>}
+    </ChatProjectSurface>
   );
 }
 

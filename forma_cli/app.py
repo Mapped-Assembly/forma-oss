@@ -26,6 +26,7 @@ from forma_cli.local import (
     init_project,
     project_root,
     read_project,
+    slice_local_project,
     status_project,
     update_linkage,
 )
@@ -37,6 +38,7 @@ from forma_cli.project_artifacts import (
     prepare_project_upload,
 )
 from forma_cli.sdk import FormaAPIClient, FormaAPIError, ProjectArtifactDownload
+from forma_core.config.compatibility import CompatibilityStatus
 from forma_core.workspaces.projects.manifest import (
     ProjectManifest,
     normalize_artifact_media_type,
@@ -51,7 +53,73 @@ def _print_json(value: Any) -> None:
 
 
 def _client(args: argparse.Namespace) -> FormaAPIClient:
-    return FormaAPIClient(base_url=args.api_url if getattr(args, "api_url", None) else None)
+    client = FormaAPIClient(base_url=args.api_url if getattr(args, "api_url", None) else None)
+    notice = client.compatibility_notice()
+    if notice:
+        print(notice, file=sys.stderr)
+    return client
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    result = _client(args).check_compatibility()
+    payload = {
+        "cli_version": __version__,
+        "status": result.status.value,
+        "latest_version": result.latest_version,
+        "minimum_supported_version": result.minimum_supported_version,
+        "protocol_version": result.protocol_version,
+        "hardware_ir_version": result.hardware_ir_version,
+        "message": result.message,
+        "upgrade_command": result.upgrade_command,
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        print("Forma-OSS")
+        print(f"CLI:            {payload['cli_version']}")
+        print(f"Latest:         {payload['latest_version'] or 'unavailable'}")
+        print(f"Minimum:        {payload['minimum_supported_version'] or 'unavailable'}")
+        print(f"Protocol:       {payload['protocol_version'] or 'unavailable'}")
+        print(f"Hardware Intermediate Representation:    {payload['hardware_ir_version'] or 'unavailable'}")
+        print(f"Status:         {payload['status']}")
+        if result.status == CompatibilityStatus.UPDATE_AVAILABLE:
+            print(f"Upgrade:        {result.upgrade_command}")
+        elif result.status == CompatibilityStatus.REMOTE_VERSION_UNAVAILABLE:
+            print(result.message)
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    client = _client(args)
+    compatibility = client.check_compatibility()
+    checks: list[dict[str, str]] = [
+        {
+            "name": "Forma version",
+            "status": "ok" if not compatibility.is_blocking else "fail",
+            "message": compatibility.message,
+        },
+        {
+            "name": "Hosted compatibility endpoint",
+            "status": "ok" if compatibility.status != CompatibilityStatus.REMOTE_VERSION_UNAVAILABLE else "unavailable",
+            "message": compatibility.status.value,
+        },
+    ]
+    if client._saved_tokens():
+        try:
+            identity = client.whoami()
+        except FormaAPIError as exc:
+            checks.append({"name": "Authentication", "status": "fail", "message": str(exc)})
+        else:
+            checks.append({"name": "Authentication", "status": "ok", "message": identity.subject})
+    else:
+        checks.append({"name": "Authentication", "status": "not configured", "message": "Run `forma-oss login`."})
+    if args.json:
+        _print_json({"cli_version": __version__, "checks": checks})
+    else:
+        print("Forma-OSS doctor")
+        for check in checks:
+            print(f"{check['status'].upper():14} {check['name']}: {check['message']}")
+    return 1 if any(check["status"] == "fail" for check in checks) else 0
 
 
 def cmd_login(args: argparse.Namespace) -> int:
@@ -193,6 +261,138 @@ def cmd_render(args: argparse.Namespace) -> int:
         ),
     )
     print(f"Rendered {manifest.title or manifest.project_id} at {output}")
+    return 0
+
+
+def _printer_registry():
+    from forma_core.workspaces.projects.fabrication import load_printer_registry
+
+    return load_printer_registry()
+
+
+def cmd_printer_list(args: argparse.Namespace) -> int:
+    registry = _printer_registry()
+    rows = [
+        {
+            "printer_id": printer.printer_id,
+            "display_name": printer.display_name,
+            "backend": printer.backend,
+            "default_profile": printer.default_profile,
+            "default": registry.default_printer == printer.printer_id,
+            "profiles": sorted(printer.profiles),
+        }
+        for printer in sorted(registry.printers.values(), key=lambda item: item.printer_id)
+    ]
+    if args.json:
+        _print_json(rows)
+    else:
+        for row in rows:
+            marker = "*" if row["default"] else " "
+            print(f"{marker} {row['printer_id']}\t{row['backend']}\t{row['default_profile']}\t{row['display_name']}")
+    return 0
+
+
+def cmd_printer_show(args: argparse.Namespace) -> int:
+    registry = _printer_registry()
+    printer = registry.printers.get(args.printer_id)
+    if printer is None:
+        raise ValueError(f"Printer configuration not found: {args.printer_id}")
+    payload = printer.model_dump(mode="json")
+    payload["default"] = registry.default_printer == printer.printer_id
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"{printer.display_name} ({printer.printer_id})")
+        print(f"Backend: {printer.backend}")
+        print(f"Default profile: {printer.default_profile}")
+        for name, profile in sorted(printer.profiles.items()):
+            print(f"Profile {name}: {profile.native_config}")
+    return 0
+
+
+def cmd_printer_add(args: argparse.Namespace) -> int:
+    from forma_core.workspaces.projects.fabrication import (
+        PrinterProfileReference,
+        UserPrinterConfig,
+        save_printer_registry,
+    )
+
+    registry = _printer_registry()
+    if args.printer_id in registry.printers:
+        raise ValueError(f"Printer configuration already exists: {args.printer_id}")
+    if not args.profiles:
+        raise ValueError("At least one --profile NAME=PATH is required.")
+    profiles = {}
+    for value in args.profiles:
+        name, separator, native_config = value.partition("=")
+        if not separator or not name.strip() or not native_config.strip():
+            raise ValueError("Profiles must use NAME=PATH format.")
+        profiles[name.strip()] = PrinterProfileReference(native_config=native_config.strip())
+    printer = UserPrinterConfig(
+        printer_id=args.printer_id,
+        display_name=args.display_name or args.printer_id,
+        backend=args.backend,
+        default_profile=args.default_profile or next(iter(profiles)),
+        profiles=profiles,
+    )
+    registry.printers[printer.printer_id] = printer
+    if args.set_default or registry.default_printer is None:
+        registry.default_printer = printer.printer_id
+    save_printer_registry(registry)
+    print(f"Added printer {printer.printer_id}")
+    return 0
+
+
+def cmd_printer_set_default(args: argparse.Namespace) -> int:
+    from forma_core.workspaces.projects.fabrication import save_printer_registry
+
+    registry = _printer_registry()
+    if args.printer_id not in registry.printers:
+        raise ValueError(f"Printer configuration not found: {args.printer_id}")
+    registry.default_printer = args.printer_id
+    save_printer_registry(registry)
+    print(f"Default printer: {args.printer_id}")
+    return 0
+
+
+def cmd_printer_remove(args: argparse.Namespace) -> int:
+    from forma_core.workspaces.projects.fabrication import save_printer_registry
+
+    registry = _printer_registry()
+    if args.printer_id not in registry.printers:
+        raise ValueError(f"Printer configuration not found: {args.printer_id}")
+    del registry.printers[args.printer_id]
+    if registry.default_printer == args.printer_id:
+        registry.default_printer = next(iter(sorted(registry.printers)), None)
+    save_printer_registry(registry)
+    print(f"Removed printer {args.printer_id}")
+    return 0
+
+
+def cmd_project_slice(args: argparse.Namespace) -> int:
+    if args.project_id:
+        project_id = read_project(args.path).project_id
+        if args.project_id != project_id:
+            raise ValueError(f"Project ID mismatch: manifest contains {project_id}, requested {args.project_id}.")
+    manifest = slice_local_project(
+        args.path,
+        printer_id=args.printer,
+        backend=args.backend,
+        profile=args.profile,
+        profile_name=args.profile_name,
+        output_name=args.output_name,
+    )
+    result = {
+        "project_id": manifest.project_id,
+        "operation": "slice",
+        "artifacts": [artifact.model_dump(mode="json") for artifact in manifest.artifacts if artifact.path.startswith("fabrication/")],
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Sliced project {manifest.project_id}")
+        for artifact in result["artifacts"]:
+            print(f"Wrote {artifact['path']}")
     return 0
 
 
@@ -354,6 +554,10 @@ def _download_parts(download: Any) -> tuple[bytes, str | None, str | None, int |
     )
 
 
+def _push_idempotency_key(upload_payload: dict[str, Any]) -> str:
+    return f"push:{_manifest_digest(upload_payload)}"
+
+
 def cmd_projects_push(args: argparse.Namespace) -> int:
     root = project_root(args.path)
     manifest = read_project(root)
@@ -365,12 +569,15 @@ def cmd_projects_push(args: argparse.Namespace) -> int:
             print("Upload cancelled.")
         return 1
     linkage = load_linkage(root)
+    idempotency_key = args.key or _push_idempotency_key(upload_payload)
     client = _client(args)
-    revision = client.push_project(
+    delivery = client.push_project(
         upload_payload,
+        idempotency_key=idempotency_key,
         parent_revision_id=linkage.get("revision_id"),
+        visibility=args.visibility,
     )
-    if revision.project_id != manifest.project_id:
+    if delivery.project.project_id != manifest.project_id:
         raise LocalProjectError("Cloud push returned a different project identity; refusing to update local linkage.")
     artifact_statuses: list[dict[str, Any]] = []
     for artifact in local_artifacts:
@@ -384,8 +591,8 @@ def cmd_projects_push(args: argparse.Namespace) -> int:
             )
         try:
             response = client.upload_project_artifact(
-                revision.project_id,
-                revision.revision_id,
+                delivery.project.project_id,
+                delivery.project.revision_id,
                 artifact.sha256,
                 content,
                 artifact.media_type,
@@ -416,6 +623,12 @@ def cmd_projects_push(args: argparse.Namespace) -> int:
                 "size_bytes": artifact.size_bytes,
             }
         )
+    try:
+        completed = client.complete_delivery(delivery.delivery_id)
+    except FormaAPIError as exc:
+        raise LocalProjectError(
+            f"Delivery session {delivery.delivery_id} could not be completed: {exc}"
+        ) from exc
     if local_artifacts:
         # Persist the same portable, secret-free shape that was committed remotely.
         write_project_manifest(root / "forma-project.json", ProjectManifest.model_validate(upload_payload))
@@ -423,26 +636,27 @@ def cmd_projects_push(args: argparse.Namespace) -> int:
         root,
         version=1,
         remote=args.api_url.rstrip("/") if args.api_url else api_url(),
-        remote_project_id=revision.project_id,
+        remote_project_id=completed.project.project_id,
         project_id=manifest.project_id,
-        revision_id=revision.revision_id,
-        parent_revision_id=revision.parent_revision_id,
+        revision_id=completed.project.revision_id,
+        parent_revision_id=completed.project.parent_revision_id,
         manifest_digest=_manifest_digest(upload_payload),
         artifact_digests=json.dumps(
             {artifact.path: artifact.sha256 for artifact in local_artifacts},
             sort_keys=True,
         ),
     )
-    payload = revision.model_dump(mode="json")
+    payload = completed.model_dump(mode="json")
     payload["operation"] = "push"
+    payload["idempotency_key"] = idempotency_key
     payload["artifacts"] = artifact_statuses
     payload["artifact_summary"] = _artifact_summary(artifact_statuses)
-    payload["project_url"] = _project_url(client.base_url or api_url(), revision.project_id)
+    payload["project_url"] = _project_url(client.base_url or api_url(), completed.project.project_id)
     if args.json:
         _print_json(payload)
     else:
-        print(f"Uploaded private project {revision.project_id} revision {revision.revision_id}")
-        print(f"Uploaded {len(artifact_statuses)} project artifact(s)")
+        print(f"Delivered project {completed.project.project_id} revision {completed.project.revision_id}")
+        print(f"Visibility: {completed.project.visibility}")
         print(f"Project URL: {payload['project_url']}")
     return 0
 
@@ -545,6 +759,130 @@ def cmd_projects_pull(args: argparse.Namespace) -> int:
     return 0
 
 
+def _delivery_idempotency_key(upload_payload: dict[str, Any]) -> str:
+    return f"deliver:{_manifest_digest(upload_payload)}"
+
+
+def cmd_projects_deliver(args: argparse.Namespace) -> int:
+    root = project_root(args.path)
+    manifest = read_project(root)
+    upload_payload, local_artifacts = prepare_project_upload(root, manifest)
+    if not _confirm_push(args, manifest):
+        if args.json:
+            _print_json({"ok": False, "operation": "deliver", "status": "cancelled"})
+        else:
+            print("Deliver cancelled.")
+        return 1
+    linkage = load_linkage(root)
+    idempotency_key = args.key or _delivery_idempotency_key(upload_payload)
+    client = _client(args)
+    delivery = client.deliver_project(
+        upload_payload,
+        idempotency_key=idempotency_key,
+        parent_revision_id=linkage.get("revision_id"),
+        visibility=args.visibility,
+    )
+    if delivery.project.project_id != manifest.project_id:
+        raise LocalProjectError("Cloud delivery returned a different project identity; refusing to update local linkage.")
+    artifact_statuses: list[dict[str, Any]] = []
+    for artifact in local_artifacts:
+        try:
+            content = artifact.source_path.read_bytes()
+        except OSError as exc:
+            raise LocalProjectError(f"Could not read project artifact {artifact.path}: {exc}") from exc
+        if hashlib.sha256(content).hexdigest() != artifact.sha256:
+            raise LocalProjectError(
+                f"Project artifact {artifact.path} changed after validation; refusing to upload it."
+            )
+        try:
+            response = client.upload_project_artifact(
+                delivery.project.project_id,
+                delivery.project.revision_id,
+                artifact.sha256,
+                content,
+                artifact.media_type,
+            )
+        except FormaAPIError as exc:
+            raise LocalProjectError(f"Could not upload project artifact {artifact.path}: {exc}") from exc
+        response_sha256 = str(response.get("sha256") or artifact.sha256).strip().lower()
+        response_media_type = str(response.get("media_type") or artifact.media_type)
+        try:
+            response_media_type = normalize_artifact_media_type(response_media_type)
+        except ValueError as exc:
+            raise LocalProjectError(f"Cloud artifact validation failed for {artifact.path}.") from exc
+        if response_sha256 != artifact.sha256 or response_media_type != artifact.media_type:
+            raise LocalProjectError(f"Cloud artifact validation failed for {artifact.path}.")
+        response_size = response.get("size_bytes")
+        if response_size is not None:
+            try:
+                if int(response_size) != artifact.size_bytes:
+                    raise LocalProjectError(f"Cloud artifact validation failed for {artifact.path}.")
+            except (TypeError, ValueError) as exc:
+                raise LocalProjectError(f"Cloud artifact validation failed for {artifact.path}.") from exc
+        artifact_statuses.append(
+            {
+                "path": artifact.path,
+                "status": str(response.get("status") or "uploaded"),
+                "sha256": artifact.sha256,
+                "media_type": artifact.media_type,
+                "size_bytes": artifact.size_bytes,
+            }
+        )
+    try:
+        completed = client.complete_delivery(delivery.delivery_id)
+    except FormaAPIError as exc:
+        raise LocalProjectError(
+            f"Delivery session {delivery.delivery_id} could not be completed: {exc}"
+        ) from exc
+    if local_artifacts:
+        write_project_manifest(root / "forma-project.json", ProjectManifest.model_validate(upload_payload))
+    update_linkage(
+        root,
+        remote=args.api_url.rstrip("/") if args.api_url else api_url(),
+        remote_project_id=completed.project.project_id,
+        project_id=manifest.project_id,
+        revision_id=completed.project.revision_id,
+        parent_revision_id=completed.project.parent_revision_id,
+        manifest_digest=_manifest_digest(upload_payload),
+        artifact_digests=json.dumps(
+            {artifact.path: artifact.sha256 for artifact in local_artifacts},
+            sort_keys=True,
+        ),
+    )
+    payload = completed.model_dump(mode="json")
+    payload["operation"] = "deliver"
+    payload["idempotency_key"] = idempotency_key
+    payload["artifacts"] = artifact_statuses
+    payload["project_url"] = _project_url(client.base_url or api_url(), completed.project.project_id)
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"Delivered project {completed.project.project_id} revision {completed.project.revision_id}")
+        print(f"Visibility: {completed.project.visibility}")
+        print(f"Project URL: {payload['project_url']}")
+    return 0
+
+
+def cmd_projects_publish(args: argparse.Namespace) -> int:
+    root = project_root(args.path)
+    linkage = load_linkage(root)
+    project_id = args.project_id or linkage.get("remote_project_id") or linkage.get("project_id")
+    if not project_id:
+        raise LocalProjectError("No remote project is linked. Deliver or push it first, or pass --project-id.")
+    result = _client(args).publish_project(project_id)
+    payload = dict(result)
+    payload["operation"] = "publish"
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"Project {project_id} is now {result.get('visibility', 'public')}")
+        if result.get("published"):
+            print(f"Published from {result.get('visibility_before')} by explicit action ({result.get('published_at')}).")
+        else:
+            print("Project was already public; no change was recorded.")
+    return 0
+
+
 def _manifest_digest(value: Any) -> str:
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
@@ -628,6 +966,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    version = subparsers.add_parser("version", help="Show local and hosted compatibility information.")
+    version.add_argument("--json", action="store_true")
+    version.set_defaults(func=cmd_version)
+    doctor = subparsers.add_parser("doctor", help="Check local, hosted, and authentication compatibility.")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
+
     login = subparsers.add_parser("login", help="Authenticate with browser/device authorization.")
     login.add_argument("--no-browser", action="store_true", help="Print the approval URL without opening a browser.")
     login.set_defaults(func=cmd_login)
@@ -655,7 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
     build.set_defaults(func=cmd_build)
     imported = subparsers.add_parser(
         "import",
-        help="Import an existing generated HardwareIR project and its native CAD artifacts.",
+        help="Import an existing generated Hardware Intermediate Representation project and its native CAD artifacts.",
     )
     imported.add_argument("source", help="Existing forma-project.json or its containing directory.")
     imported.add_argument("--path", default=None, help="Destination project directory; defaults to the source directory.")
@@ -684,6 +1029,43 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--yaw", type=float, default=0.0)
     render.set_defaults(func=cmd_render)
 
+    printer = subparsers.add_parser("printer", help="Manage the local user printer registry.")
+    printer_commands = printer.add_subparsers(dest="printer_command", required=True)
+    printer_add = printer_commands.add_parser("add", help="Register a printer and native slicing profile.")
+    printer_add.add_argument("printer_id")
+    printer_add.add_argument("--backend", required=True)
+    printer_add.add_argument("--profile", dest="profiles", action="append", required=True, metavar="NAME=PATH")
+    printer_add.add_argument("--display-name")
+    printer_add.add_argument("--default-profile")
+    printer_add.add_argument("--set-default", action="store_true")
+    printer_add.set_defaults(func=cmd_printer_add)
+    printer_list = printer_commands.add_parser("list", help="List registered printers.")
+    printer_list.add_argument("--json", action="store_true")
+    printer_list.set_defaults(func=cmd_printer_list)
+    printer_show = printer_commands.add_parser("show", help="Show a registered printer.")
+    printer_show.add_argument("printer_id")
+    printer_show.add_argument("--json", action="store_true")
+    printer_show.set_defaults(func=cmd_printer_show)
+    printer_default = printer_commands.add_parser("set-default", help="Select the default printer.")
+    printer_default.add_argument("printer_id")
+    printer_default.set_defaults(func=cmd_printer_set_default)
+    printer_remove = printer_commands.add_parser("remove", help="Remove a registered printer.")
+    printer_remove.add_argument("printer_id")
+    printer_remove.set_defaults(func=cmd_printer_remove)
+
+    project = subparsers.add_parser("project", help="Run operations on a local Forma project.")
+    project_commands = project.add_subparsers(dest="project_command", required=True)
+    project_slice = project_commands.add_parser("slice", help="Slice an existing project mesh into validated G-code.")
+    project_slice.add_argument("project_id", nargs="?")
+    project_slice.add_argument("--path", default=".")
+    project_slice.add_argument("--printer")
+    project_slice.add_argument("--backend")
+    project_slice.add_argument("--profile", help="Native slicer profile/config path.")
+    project_slice.add_argument("--profile-name")
+    project_slice.add_argument("--output-name")
+    project_slice.add_argument("--json", action="store_true")
+    project_slice.set_defaults(func=cmd_project_slice)
+
     projects = subparsers.add_parser("projects", help="Manage explicit cloud project synchronization.")
     project_commands = projects.add_subparsers(dest="projects_command", required=True)
     projects_list = project_commands.add_parser("list", help="List private cloud projects.")
@@ -691,6 +1073,8 @@ def build_parser() -> argparse.ArgumentParser:
     projects_list.set_defaults(func=cmd_projects_list)
     push = project_commands.add_parser("push", help="Upload the canonical manifest and referenced artifacts explicitly.")
     push.add_argument("--path", default=".")
+    push.add_argument("--key", help="Idempotency key; defaults to a digest of the pushed manifest.")
+    push.add_argument("--visibility", choices=("public", "private"), default=None)
     push.add_argument("--yes", action="store_true", help="Confirm upload without prompting.")
     push.add_argument("--json", action="store_true")
     push.set_defaults(func=cmd_projects_push)
@@ -700,6 +1084,21 @@ def build_parser() -> argparse.ArgumentParser:
     pull.add_argument("--revision-id")
     pull.add_argument("--json", action="store_true")
     pull.set_defaults(func=cmd_projects_pull)
+    deliver = project_commands.add_parser(
+        "deliver",
+        help="Deliver a private snapshot with an idempotent receipt accepted only after artifacts are verified.",
+    )
+    deliver.add_argument("--path", default=".")
+    deliver.add_argument("--key", help="Idempotency key; defaults to a digest of the delivered manifest.")
+    deliver.add_argument("--visibility", choices=("public", "private"), default=None)
+    deliver.add_argument("--yes", action="store_true", help="Confirm delivery without prompting.")
+    deliver.add_argument("--json", action="store_true")
+    deliver.set_defaults(func=cmd_projects_deliver)
+    publish = project_commands.add_parser("publish", help="Explicitly publish an owned private project.")
+    publish.add_argument("--path", default=".")
+    publish.add_argument("--project-id")
+    publish.add_argument("--json", action="store_true")
+    publish.set_defaults(func=cmd_projects_publish)
 
     keys = subparsers.add_parser("keys", help="Manage local or hosted provider credentials.")
     key_commands = keys.add_subparsers(dest="keys_command", required=True)
