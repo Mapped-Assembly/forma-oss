@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -87,6 +88,16 @@ class CloudProjectRevision(BaseModel):
     parent_revision_id: str | None = None
     manifest: dict[str, Any]
     created_at: str | None = None
+    delivery_id: str | None = None
+
+
+class CloudProjectDelivery(BaseModel):
+    """Asynchronous project delivery returned by newer Forma API deployments."""
+
+    model_config = ConfigDict(extra="allow")
+
+    delivery_id: str
+    completed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -322,13 +333,44 @@ class FormaAPIClient:
         *,
         parent_revision_id: str | None = None,
     ) -> CloudProjectRevision:
-        payload = self._request(
-            "/cli/projects/push",
-            method="POST",
-            payload={"manifest": dict(manifest), "parent_revision_id": parent_revision_id},
-            authenticated=True,
-        )
+        request_payload = {
+            "manifest": dict(manifest),
+            "parent_revision_id": parent_revision_id,
+        }
+        try:
+            payload = self._request(
+                "/cli/projects/deliver",
+                method="POST",
+                payload={**request_payload, "idempotency_key": f"forma-cli-{uuid4().hex}"},
+                authenticated=True,
+            )
+        except FormaAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            payload = self._request(
+                "/cli/projects/push",
+                method="POST",
+                payload=request_payload,
+                authenticated=True,
+            )
+        if isinstance(payload, dict) and payload.get("delivery_id"):
+            delivery = CloudProjectDelivery.model_validate(payload)
+            project = payload.get("project") or {}
+            payload = {
+                "revision_id": project.get("revision_id"),
+                "project_id": project.get("project_id"),
+                "revision": project.get("revision"),
+                "parent_revision_id": project.get("parent_revision_id"),
+                "manifest": dict(manifest),
+                "created_at": payload.get("created_at"),
+                "delivery_id": delivery.delivery_id,
+            }
         return CloudProjectRevision.model_validate(payload)
+
+    def complete_project_delivery(self, delivery_id: str) -> dict[str, Any]:
+        """Finalize an asynchronous project delivery into a cloud revision."""
+        path = f"/cli/projects/deliver/{quote(delivery_id, safe='')}/complete"
+        return self._request(path, method="POST", payload={}, authenticated=True)
 
     def upload_project_artifact(
         self,

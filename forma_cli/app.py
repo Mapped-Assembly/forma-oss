@@ -416,6 +416,19 @@ def cmd_projects_push(args: argparse.Namespace) -> int:
                 "size_bytes": artifact.size_bytes,
             }
         )
+    if revision.delivery_id:
+        completed = client.complete_project_delivery(revision.delivery_id)
+        completed_project = completed.get("project") or completed
+        completed_revision = type(revision).model_validate(
+            {
+                **completed_project,
+                "manifest": revision.manifest,
+                "created_at": completed.get("created_at") or completed_project.get("created_at"),
+            }
+        )
+        if completed_revision.project_id != revision.project_id or completed_revision.revision_id != revision.revision_id:
+            raise LocalProjectError("Cloud delivery completed with a different project revision.")
+        revision = completed_revision
     if local_artifacts:
         # Persist the same portable, secret-free shape that was committed remotely.
         write_project_manifest(root / "forma-project.json", ProjectManifest.model_validate(upload_payload))

@@ -137,7 +137,7 @@ class CadGenerationTests(unittest.TestCase):
                     )
                 if tree is not None:
                     tree.write_text("{}", encoding="utf-8")
-                return {"valid": True, "opencad_version": "0.2.3"}
+                return {"valid": True, "opencad_version": "0.2.4"}
 
             project = mechanical_project()
             with patch.dict("os.environ", {"FORMA_CAD_WORKSPACE": workspace}, clear=False), patch(
