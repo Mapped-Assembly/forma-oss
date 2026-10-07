@@ -136,3 +136,17 @@ Try a design, share what worked, or help improve CAD generation, validation, exa
 **If you want open-source hardware design to be easier, star Forma to follow its progress and help other builders find it.**
 
 Built by [Caid Technologies](https://caid-technologies.us/). Licensed under the [Mozilla Public License 2.0](LICENSE).
+
+## Citation
+
+If you use Forma-OSS in research, publications, or other academic work, please cite the project:
+
+```bibtex
+@software{mapped_assembly_forma_oss_2026,
+  author = {{Mapped Assembly}},
+  title = {Forma-OSS: Open-source AI hardware design workspace},
+  year = {2026},
+  url = {https://github.com/Mapped-Assembly/forma-oss},
+  note = {Open-source software}
+}
+```
