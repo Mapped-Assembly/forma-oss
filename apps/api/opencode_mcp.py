@@ -27,7 +27,7 @@ from forma_core.opencode.models import (
     AuthoringToolError,
 )
 from forma_core.database import get_latest_project_revision, get_project_revision_by_source_job
-from forma_core.validation import build_validation_summary, validate_circuit
+from forma_core.validation import build_validation_summary, validate_project
 from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 from forma_core.workspaces.projects.outcomes import evaluate_design_outcome
 from forma_core.utils import generate_mermaid_chart, generate_svg_schematic
@@ -250,7 +250,7 @@ def _compile(project: HardwareIntermediateRepresentation, project_id: str, user_
                          if is_image_metadata(key) or key == "component_asset_refs"})
     metadata.update({"project_id": project_id, "authoring_agent": "opencode"})
     project.assembly_metadata = metadata
-    issues = validate_circuit(project.components, project.nets, project.requirements)
+    issues = validate_project(project)
     project.validation = build_validation_summary(issues)
     project.is_valid = not project.validation.critical
     ensure_native_cad_model(project, project_id=project_id,
@@ -295,7 +295,7 @@ def _tool_result(project: HardwareIntermediateRepresentation, project_id: str, r
 
 
 def _validation_result(project: HardwareIntermediateRepresentation) -> dict[str, object]:
-    issues = validate_circuit(project.components, project.nets, project.requirements)
+    issues = validate_project(project)
     return {"is_valid": not any(issue.severity.upper() == "CRITICAL" for issue in issues), "issues": [issue.model_dump(mode="json") for issue in issues]}
 
 

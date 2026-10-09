@@ -1,0 +1,22 @@
+{
+  "required_paths": [
+    {
+      "source_id": "vascular_inlet",
+      "waste_id": "vascular_waste"
+    },
+    {
+      "source_id": "epithelial_inlet",
+      "waste_id": "epithelial_waste"
+    }
+  ],
+  "expected_flow_rates_ul_min": {
+    "vascular_channel": 30,
+    "epithelial_channel": 10
+  },
+  "required_membranes": [
+    {
+      "side_a_id": "vascular_channel",
+      "side_b_id": "epithelial_channel"
+    }
+  ]
+}

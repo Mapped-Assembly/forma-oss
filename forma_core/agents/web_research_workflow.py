@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_serializer
 
+from forma_core.fluidics.models import FluidicSystem
+
 from forma_core.external_sources import ExternalSourceLibrary, build_external_source_provider
 from forma_core.agents.orchestrator import (
     HardwarePipelineOrchestrator,
@@ -67,6 +69,7 @@ from forma_core.validation import (
     build_validation_summary,
     check_safety_violations,
     validate_circuit,
+    validate_fluidics,
 )
 from forma_core.wiring import (
     WiringIntent,
@@ -85,6 +88,7 @@ class WebProjectPlan(BaseModel):
     overview: ProjectOverview
     requirements: FunctionalRequirements
     system_architecture: SystemArchitecture
+    fluidic_system: FluidicSystem | None = None
     architecture_notes: List[str] = Field(default_factory=list)
     recommended_component_roles: List[str] = Field(default_factory=list)
     research_keywords: List[str] = Field(default_factory=list)
@@ -431,7 +435,7 @@ class WebResearchHardwarePipeline:
         logger.info("Invoking Hardware Output Completeness Auditor Agent...")
         with agent_pipeline_step(self.workflow_id, "completeness_audit"):
             audit = self._audit_output(plan, components, nets, mechanical, assembly, validation_issues)
-            all_issues = [*validation_issues, *self._audit_to_validation_issues(audit)]
+            all_issues = [*validation_issues, *self._audit_to_validation_issues(audit), *validate_fluidics(plan.fluidic_system)]
 
         logger.info("Packaging web research project artifacts...")
         with agent_pipeline_step(self.workflow_id, "package_project"):
@@ -440,6 +444,7 @@ class WebResearchHardwarePipeline:
                 overview=plan.overview,
                 requirements=plan.requirements,
                 system_architecture=plan.system_architecture,
+                fluidic_system=plan.fluidic_system,
                 components=components,
                 nets=nets,
                 buses=buses,
@@ -696,7 +701,8 @@ class WebResearchHardwarePipeline:
         nets = list(validation.nets if validation is not None else (wiring.nets if wiring is not None else []))
         pin_mappings = derive_pin_mappings(components, nets)
         validation_issues = list(validation.issues if validation is not None else [])
-        all_issues = [*validation_issues, *(self._audit_to_validation_issues(audit) if audit is not None else [])]
+        all_issues = [*validation_issues, *(self._audit_to_validation_issues(audit) if audit is not None else []),
+                      *validate_fluidics(plan.fluidic_system if plan is not None else None)]
         assembly = list(assembly_wrapper.steps if assembly_wrapper is not None else [])
         constraints = []
         if plan is not None:
@@ -738,6 +744,7 @@ class WebResearchHardwarePipeline:
             overview=plan.overview if plan is not None else None,
             requirements=plan.requirements if plan is not None else None,
             system_architecture=plan.system_architecture if plan is not None else None,
+            fluidic_system=plan.fluidic_system if plan is not None else None,
             components=components,
             nets=nets,
             buses=extract_buses(nets),
@@ -876,6 +883,17 @@ class WebResearchHardwarePipeline:
 
         External source research context:
         {research_context}
+
+        For organ-on-a-chip or liquid microchannel requests, populate fluidic_system with the complete
+        nominal open-valve network. Use directed channels connecting declared inlet/outlet, reservoir,
+        pump, valve or chamber nodes. Assign distinct circuit_id values to separated fluid circuits.
+        Represent a porous interface using membranes (channel/chamber references), never a bulk-flow
+        channel between circuits. Chamber inlet_ids/outlet_ids are incident channel IDs. Include each
+        requested flow and a reachable waste outlet per circuit. Add an independent dosing inlet only
+        when requested, joining the intended circuit; conserve summed flow downstream. Supply explicit
+        fluid properties with provenance for pressure estimates; do not invent unknown properties.
+        Leave fluidic_system null for projects without fluidics. This is a research design contract,
+        not a CFD, biological or clinical validation.
 
         Return WebProjectPlan. Prefer concrete component roles that are supported by the research context.
         Build system_architecture as a purpose-driven hierarchy with a product root and applicable electrical,

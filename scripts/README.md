@@ -4,7 +4,7 @@ Run scripts from the repository root. They are grouped by the concern they opera
 
 - `continuous/` — JSONL stream utilities, continuous agents, and queued LLM jobs.
 - `development/` — local backend/frontend development launchers and log helpers.
-- `media/` — terminal dashboards, image display, and mechanical video rendering.
+- `media/` — terminal dashboards, image display, and mechanical video rendering, and the organ-chip flow schematic (`media/render_fluidic_demo.py`).
 - `models/` — provider verification, smoke tests, and comparative model samples.
 - `operations/` — production configuration, Supabase maintenance, and artifact uploads.
 - `quality/` — deterministic tests, Rust checks, and performance benchmarks.

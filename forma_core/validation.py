@@ -1,8 +1,10 @@
 from typing import List, Dict, Set, Optional
+from forma_core.fluidics import FluidicSystem, validate_fluidic_system
 from forma_core.workspaces.projects.models import (
     ComponentInstance,
     ConnectionNet,
     FunctionalRequirements,
+    HardwareIntermediateRepresentation,
     PinDefinition,
     ValidationIssue,
     ValidationSummary,
@@ -369,6 +371,25 @@ def validate_circuit(
                 ))
 
     return issues
+
+def validate_fluidics(system: FluidicSystem | None) -> List[ValidationIssue]:
+    """Adapt fluid-network diagnostics to the existing project validation contract."""
+    if system is None:
+        return []
+    return [ValidationIssue(
+        severity="CRITICAL", category=f"Fluidics: {issue.code}",
+        description=f"{issue.entity_id}: {issue.message}",
+        troubleshooting="Correct the fluidic_system references or supplied operating constraints and revalidate.",
+    ) for issue in validate_fluidic_system(system)]
+
+
+def validate_project(project: HardwareIntermediateRepresentation) -> List[ValidationIssue]:
+    """Validate the existing electrical contract plus optional fluidics."""
+    return [
+        *validate_circuit(project.components, project.nets, project.requirements),
+        *validate_fluidics(project.fluidic_system),
+    ]
+
 
 def build_validation_summary(issues: List[ValidationIssue]) -> ValidationSummary:
     """

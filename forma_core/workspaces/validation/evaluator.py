@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from forma_core.fluidics import validate_fluidic_system
 
 from forma_core.workspaces.design_briefs import DesignBrief
 from forma_core.workspaces.projects import ProjectRevision
@@ -261,6 +262,18 @@ def evaluate_project_revision(
             findings.extend(_constraint_findings(revision, design_brief))
         elif normalized == "consistency":
             findings.extend(_consistency_findings(revision))
+            if revision.state.fluidic_system is not None:
+                fluidic_issues = validate_fluidic_system(revision.state.fluidic_system)
+                findings.append(_finding(
+                    criterion_id="consistency:fluidic-system",
+                    criterion="Fluidic topology and supplied operating constraints are consistent",
+                    kind=ValidationFindingKind.CONSISTENCY,
+                    status=ValidationCheckStatus.FAILED if fluidic_issues else ValidationCheckStatus.PASSED,
+                    evidence=[f"{item.code}: {item.entity_id}: {item.message}" for item in fluidic_issues]
+                        or ["Fluidic topology and supplied operating constraints passed."],
+                    remediation="Correct the fluid network and revalidate." if fluidic_issues else "No action required.",
+                    artifact_id=_artifact_for(revision, "project-state"),
+                ))
         elif normalized == "assumptions":
             findings.extend(_assumption_findings(revision, design_brief))
         elif normalized == "criteria":

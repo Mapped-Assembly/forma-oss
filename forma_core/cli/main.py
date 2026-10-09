@@ -213,11 +213,11 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    from forma_core.validation import build_validation_summary, validate_circuit
+    from forma_core.validation import build_validation_summary, validate_project
     from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 
     project = HardwareIntermediateRepresentation.model_validate(_hardware_ir_payload(_read_json(args.project)))
-    summary = build_validation_summary(validate_circuit(project.components, project.nets, project.requirements))
+    summary = build_validation_summary(validate_project(project))
     result = {
         "is_valid": not summary.critical,
         "validation": summary.model_dump(mode="json"),
