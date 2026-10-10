@@ -100,6 +100,15 @@ See the [CLI and runtime reference](docs/runtime-reference.md) for generation, i
 
 </details>
 
+### Publishing packages
+
+This repository publishes its existing package identities from a GitHub Release:
+
+- `caid-forma-core` is built from the root `pyproject.toml` and published to PyPI.
+- `@isayahc/forma-gui` is built from `packages/forma-gui` and published to npm.
+
+The `Publish packages` workflow validates both distributions before publishing. Configure the repository `NPM_TOKEN` secret and the PyPI trusted publisher for the `pypi` environment before creating a release. Update the package version in its own metadata, then publish a matching GitHub Release.
+
 ## Install Forma for Cursor / Grok Bot
 
 Install the [Cursor plugin](docs/cursor-plugin.md) to discover the shared
