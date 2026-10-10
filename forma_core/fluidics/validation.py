@@ -12,6 +12,8 @@ from .topology import build_topology, reachable
 
 
 class FluidicIssue(BaseModel):
+    """Blocking finding with a stable code, component ID or schema location."""
+
     code: str
     entity_id: str
     message: str
