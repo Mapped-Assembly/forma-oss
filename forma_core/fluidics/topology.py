@@ -9,6 +9,8 @@ from .models import FluidicNode, FluidicSystem
 
 @dataclass(frozen=True)
 class FluidicTopology:
+    """Node indexes and forward/reverse adjacency for declared bulk-flow edges."""
+
     nodes: dict[str, FluidicNode]
     sources: set[str]
     sinks: set[str]

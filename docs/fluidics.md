@@ -133,14 +133,57 @@ python -m pytest tests/projects/test_fluidics.py -q
 python scripts/media/render_fluidic_demo.py --output docs/assets/organ-on-chip-flow.gif
 ```
 
-The broken example exits 1. Scoring accepts a raw network or full IR and returns
-eight named checks, findings, `passed`, and an equally weighted score in [0,1].
-The external spec fixes required source-to-waste paths, channel flow targets and
-membrane-separated pairs. A topologically valid but wrong design therefore
-cannot pass. Malformed schemas score zero; structurally incomplete designs can
-earn a partial score but never pass. Only all eight checks passing returns exit 0.
+The broken example exits 1. Scoring accepts a raw network dictionary or full IR
+dictionary and returns named checks, findings, `passed`, and an equally weighted
+score in [0,1]. The external spec fixes required source-to-waste paths, channel
+flow targets and membrane-separated pairs. Optional requirements also check
+channel count and dimensions:
+
+```json
+{
+  "expected_channel_count": 6,
+  "channel_dimensions": {
+    "vascular_channel": {
+      "length_mm": {"minimum": 19, "maximum": 21},
+      "width_mm": {"minimum": 0.9, "maximum": 1.1},
+      "height_mm": {"minimum": 0.18, "maximum": 0.22}
+    }
+  }
+}
+```
+
+Add these fields alongside `required_paths`, `expected_flow_rates_ul_min` and
+`required_membranes`. All dimension bounds are inclusive, finite, positive mm
+values; a range may supply just a minimum or maximum. Empty/inverted ranges and
+non-integer counts are rejected. Missing constrained channel IDs fail the check.
+Findings identify the offending channel and dimension, including its value and
+requested bounds. These are task requirements, not assumed manufacturing or
+biological limits; choose them before evaluating candidates.
+
+`expected_channel_count` counts **all entries in `FluidicSystem.channels`**,
+including supply/feed segments. The two perfusion channels in `two-channel.json`
+use six total segments; `with-dosing.json` uses eight. The checked specifications
+require those counts and bound both perfusion channels. Geometry constraints
+need not be specified for every segment. Without count/dimension requirements,
+the original eight checks and score denominator are unchanged. Supplying either
+adds its named check (`channel_count` or `channel_dimensions`); the example specs
+use all ten checks. Any failed check prevents `passed=true` and CLI exit 0.
+Malformed candidate schemas score zero; incomplete or noncompliant designs can
+earn a partial score but never pass. Passing only certifies the supplied checks,
+not unrequested dimensions or unknown fluid properties.
+
+For benchmarks 1/2, use the same independent task spec to check requested
+constraints and deterministic topology/flow/pressure plausibility. Benchmark 4
+can mutate the JSON (remove an outlet/pump, reverse a connection, zero a width,
+introduce an unknown node or duplicate ID) and inspect `issues`/`schema_errors`;
+re-evaluate a repaired candidate with the unchanged spec. Benchmark 6 requires
+serialization and all checks to pass. For benchmark 7, retain raw model output,
+Forma output before fluid validation, and validated output separately and feed
+each to `score_fluidic_system` with that same spec. Do not replace invalid raw
+candidates with repaired ones or infer requirements from candidate data.
+
 The checked fixtures score 1.0; this is deterministic fixture validation, not a
-measured model-generation success rate.
+measured model-generation success or repair rate.
 
 The included renderer is deliberately specific to the two-channel fixture and
 rejects added branches rather than hiding them. It requires Pillow (already an

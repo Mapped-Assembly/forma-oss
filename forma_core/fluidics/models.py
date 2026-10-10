@@ -13,6 +13,8 @@ Text = Annotated[str, Field(min_length=1)]
 
 
 class FluidicModel(BaseModel):
+    """Shared strict-field, finite-number contract for fluid-specific models."""
+
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, str_strip_whitespace=True)
 
 
@@ -29,6 +31,8 @@ class FluidProperties(FluidicModel):
 
 
 class FluidicNode(FluidicModel):
+    """Addressable bulk-flow component belonging to one isolation circuit."""
+
     id: Identifier
     circuit_id: Identifier = Field("default", description="Bulk-fluid isolation group. Channels cannot cross groups.")
 
@@ -38,16 +42,22 @@ class FluidicInlet(FluidicNode):
 
 
 class FluidicOutlet(FluidicNode):
+    """Terminal boundary that collects waste, product or exhaust."""
+
     kind: Literal["waste", "product", "exhaust"] = "waste"
 
 
 class FluidicReservoir(FluidicNode):
+    """Supply, mixing junction or waste container with volume in microlitres."""
+
     volume_ul: Positive
     role: Literal["supply", "junction", "waste"] = "junction"
     contents: Text
 
 
 class FluidicPump(FluidicNode):
+    """Inline flow source with optional target and capacity in microlitres/min."""
+
     target_flow_rate_ul_min: NonNegative | None = None
     max_flow_rate_ul_min: NonNegative | None = None
 
@@ -57,6 +67,8 @@ class FluidicValve(FluidicNode):
 
 
 class FluidicChannel(FluidicModel):
+    """Directed rectangular conduit with mm geometry and explicit flow metadata."""
+
     id: Identifier
     source_id: Identifier
     target_id: Identifier
@@ -74,6 +86,8 @@ class FluidicChannel(FluidicModel):
 
 
 class FluidicChamber(FluidicNode):
+    """Flow-through volume in microlitres with incident channel IDs as ports."""
+
     volume_ul: Positive
     inlet_ids: list[Identifier] = Field(min_length=1, description="All incoming channel IDs, not boundary inlet IDs.")
     outlet_ids: list[Identifier] = Field(min_length=1, description="All outgoing channel IDs.")
@@ -94,6 +108,8 @@ class FluidicMembrane(FluidicModel):
 
 
 class FluidicSystem(FluidicModel):
+    """Optional Hardware IR subsystem; run validation to check its network."""
+
     inlets: list[FluidicInlet] = Field(default_factory=list)
     outlets: list[FluidicOutlet] = Field(default_factory=list)
     reservoirs: list[FluidicReservoir] = Field(default_factory=list)
@@ -106,6 +122,7 @@ class FluidicSystem(FluidicModel):
 
     @model_validator(mode="after")
     def unique_ids(self) -> FluidicSystem:
+        """Reject duplicate identifiers across every fluidic entity collection."""
         seen: set[str] = set()
         for collection in type(self).model_fields:
             for entity in getattr(self, collection):

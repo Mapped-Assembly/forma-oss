@@ -18,5 +18,36 @@
       "side_a_id": "vascular_channel",
       "side_b_id": "epithelial_channel"
     }
-  ]
+  ],
+  "expected_channel_count": 6,
+  "channel_dimensions": {
+    "vascular_channel": {
+      "length_mm": {
+        "minimum": 19,
+        "maximum": 21
+      },
+      "width_mm": {
+        "minimum": 0.9,
+        "maximum": 1.1
+      },
+      "height_mm": {
+        "minimum": 0.18,
+        "maximum": 0.22
+      }
+    },
+    "epithelial_channel": {
+      "length_mm": {
+        "minimum": 19,
+        "maximum": 21
+      },
+      "width_mm": {
+        "minimum": 0.9,
+        "maximum": 1.1
+      },
+      "height_mm": {
+        "minimum": 0.18,
+        "maximum": 0.22
+      }
+    }
+  }
 }

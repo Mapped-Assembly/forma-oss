@@ -8,14 +8,18 @@ import unittest
 
 from pydantic import ValidationError
 
-from forma_core.fluidics.benchmark import FluidicBenchmarkSpec, score_fluidic_system
+from forma_core.fluidics.benchmark import (
+    ChannelDimensionConstraints, DimensionRange, FluidicBenchmarkSpec, score_fluidic_system,
+)
 from forma_core.fluidics.calculations import (
     FlowCalculationError, average_velocity_mm_s, channel_volume_ul,
     cross_sectional_area_mm2, mean_wall_shear_stress_pa, pressure_drop_kpa,
     residence_time_s, reynolds_number,
 )
 from forma_core.fluidics.examples import organ_on_chip_system
-from forma_core.fluidics.models import FluidicReservoir, FluidicSystem
+from forma_core.fluidics.models import (
+    FluidicChannel, FluidicInlet, FluidicOutlet, FluidicReservoir, FluidicSystem, FluidicValve,
+)
 from forma_core.fluidics.validation import validate_fluidic_system
 from forma_core.validation import validate_project
 from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
@@ -36,6 +40,36 @@ class FluidicTests(unittest.TestCase):
         for dosing in (False, True):
             with self.subTest(dosing=dosing):
                 self.assertEqual([], validate_fluidic_system(organ_on_chip_system(dosing=dosing)))
+
+    def test_basic_inlet_channel_outlet_without_fluid_properties(self) -> None:
+        system = FluidicSystem(
+            inlets=[FluidicInlet(id="inlet")], outlets=[FluidicOutlet(id="waste")],
+            channels=[FluidicChannel(
+                id="channel", source_id="inlet", target_id="waste", length_mm=20,
+                width_mm=1, height_mm=0.2, material="PDMS", fluid="unspecified medium",
+            )],
+        )
+        self.assertEqual([], validate_fluidic_system(system))
+        self.assertEqual(system, FluidicSystem.model_validate_json(system.model_dump_json()))
+
+    def test_missing_endpoints_identify_channel_and_missing_node(self) -> None:
+        for endpoint in ("source_id", "target_id"):
+            with self.subTest(endpoint=endpoint):
+                system = organ_on_chip_system()
+                setattr(system.channels[0], endpoint, "missing_node")
+                issues = validate_fluidic_system(system)
+                self.assertTrue(any(
+                    issue.code == "unknown_node" and issue.entity_id == "vascular_supply"
+                    and "missing_node" in issue.message for issue in issues
+                ))
+
+    def test_disconnected_required_inlet_and_orphan_valve(self) -> None:
+        self.system.inlets.append(FluidicInlet(id="disconnected_inlet"))
+        self.system.valves.append(FluidicValve(id="orphan_valve"))
+        failures = {(issue.code, issue.entity_id) for issue in validate_fluidic_system(self.system)}
+        self.assertIn(("no_outlet_path", "disconnected_inlet"), failures)
+        self.assertIn(("unreachable_node", "orphan_valve"), failures)
+        self.assertIn(("no_outlet_path", "orphan_valve"), failures)
 
     def test_ir_round_trip_and_backward_compatibility(self):
         legacy = HardwareIntermediateRepresentation.model_validate({"hardware_ir_version": "0.1"})
@@ -202,6 +236,112 @@ class FluidicTests(unittest.TestCase):
         self.assertFalse(score_fluidic_system(self.system, self.spec).checks["membranes"])
         self.system.outlets[0].kind = "product"
         self.assertFalse(score_fluidic_system(self.system, self.spec).checks["requested_paths"])
+
+    def test_benchmark_channel_count_includes_feed_segments(self) -> None:
+        self.assertEqual(6, self.spec.expected_channel_count)
+        self.assertTrue(score_fluidic_system(self.system, self.spec).checks["channel_count"])
+        spec = self.spec.model_copy(deep=True)
+        spec.expected_channel_count = 7
+        result = score_fluidic_system(self.system, spec)
+        self.assertFalse(result.passed)
+        self.assertTrue(result.checks["topology"])
+        self.assertFalse(result.checks["channel_count"])
+        self.assertEqual(0.9, result.score)
+        finding = next(issue for issue in result.issues if issue.code == "requested_channel_count")
+        self.assertEqual("system", finding.entity_id)
+        self.assertIn("Expected 7 channel segments; found 6", finding.message)
+
+    def test_benchmark_dimension_ranges_reject_valid_but_wrong_designs(self) -> None:
+        for field, lower, upper in [("length_mm", 19, 21), ("width_mm", 0.9, 1.1), ("height_mm", 0.18, 0.22)]:
+            for value, expected in [(lower, True), (upper, True), (lower * 0.99, False), (upper * 1.01, False)]:
+                with self.subTest(field=field, value=value):
+                    system = organ_on_chip_system()
+                    setattr(system.channels[2], field, value)
+                    self.assertEqual([], validate_fluidic_system(system))
+                    result = score_fluidic_system(system, self.spec)
+                    self.assertEqual(expected, result.checks["channel_dimensions"])
+                    self.assertEqual(expected, result.passed)
+                    if not expected:
+                        finding = next(issue for issue in result.issues if issue.code == "requested_dimension")
+                        self.assertEqual("vascular_channel", finding.entity_id)
+                        self.assertIn(field, finding.message)
+        self.system.channels[2].width_mm = 1000
+        self.assertFalse(score_fluidic_system(self.system, self.spec).passed)
+
+    def test_benchmark_one_sided_ranges_and_missing_constrained_channel(self) -> None:
+        spec = self.spec.model_copy(deep=True)
+        spec.channel_dimensions = {
+            "vascular_channel": ChannelDimensionConstraints(
+                width_mm=DimensionRange(minimum=1), height_mm=DimensionRange(maximum=0.2),
+            ),
+        }
+        self.assertTrue(score_fluidic_system(self.system, spec).passed)
+        spec.channel_dimensions["missing_channel"] = ChannelDimensionConstraints(
+            length_mm=DimensionRange(minimum=1),
+        )
+        result = score_fluidic_system(self.system, spec)
+        self.assertFalse(result.checks["channel_dimensions"])
+        self.assertTrue(any(
+            issue.code == "requested_channel_missing" and issue.entity_id == "missing_channel"
+            for issue in result.issues
+        ))
+
+    def test_benchmark_specs_reject_invalid_ranges_and_counts(self) -> None:
+        for bounds in ({}, {"minimum": 2, "maximum": 1}, {"minimum": 0}, {"maximum": -1},
+                       {"minimum": float("nan")}, {"maximum": float("inf")}):
+            with self.subTest(bounds=bounds), self.assertRaises(ValidationError):
+                DimensionRange.model_validate(bounds)
+        with self.assertRaises(ValidationError):
+            ChannelDimensionConstraints.model_validate({})
+        for value in (0, -1, 2.5, True, "6"):
+            payload = self.spec.model_dump()
+            payload["expected_channel_count"] = value
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                FluidicBenchmarkSpec.model_validate(payload)
+        self.assertEqual(self.spec, FluidicBenchmarkSpec.model_validate_json(self.spec.model_dump_json()))
+
+    def test_legacy_benchmark_specs_keep_original_eight_checks(self) -> None:
+        payload = self.spec.model_dump(exclude={"expected_channel_count", "channel_dimensions"})
+        spec = FluidicBenchmarkSpec.model_validate(payload)
+        result = score_fluidic_system(self.system, spec)
+        self.assertTrue(result.passed)
+        self.assertEqual(1, result.score)
+        self.assertEqual(8, len(result.checks))
+        self.assertNotIn("channel_count", result.checks)
+        self.assertNotIn("channel_dimensions", result.checks)
+
+    def test_raw_generated_and_validated_candidates_use_same_external_spec(self) -> None:
+        raw = self.system.model_dump(mode="json")
+        unvalidated = HardwareIntermediateRepresentation(fluidic_system=self.system).model_dump(mode="json")
+        validated = HardwareIntermediateRepresentation.model_validate(unvalidated)
+        self.assertEqual([], validate_project(validated))
+        expected = score_fluidic_system(raw, self.spec)
+        for payload in (unvalidated, validated.model_dump(mode="json")):
+            self.assertEqual(expected, score_fluidic_system(payload, self.spec))
+
+    def test_fault_injection_and_external_repair_are_deterministic(self) -> None:
+        original = self.system.model_dump(mode="json")
+        for fault in ("remove_outlet", "reverse_connection", "zero_width", "unknown_node", "remove_pump", "duplicate_id"):
+            with self.subTest(fault=fault):
+                payload = json.loads(json.dumps(original))
+                channel = payload["channels"][0]
+                if fault == "remove_outlet":
+                    payload["outlets"].pop(0)
+                elif fault == "reverse_connection":
+                    channel["source_id"], channel["target_id"] = channel["target_id"], channel["source_id"]
+                elif fault == "zero_width":
+                    channel["width_mm"] = 0
+                elif fault == "unknown_node":
+                    channel["target_id"] = "missing_node"
+                elif fault == "remove_pump":
+                    payload["pumps"].pop(0)
+                else:
+                    payload["channels"].append(dict(channel))
+                result = score_fluidic_system(payload, self.spec)
+                self.assertFalse(result.passed)
+                self.assertTrue(result.issues or result.schema_errors)
+                self.assertEqual(result, score_fluidic_system(payload, self.spec))
+                self.assertTrue(score_fluidic_system(original, self.spec).passed)
 
     def test_empty_missing_and_malformed_networks_cannot_pass(self):
         for payload in ({}, None, {"fluidic_system": None}, {"channels": [{"length_mm": -1}]}):
