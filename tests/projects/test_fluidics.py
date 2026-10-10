@@ -9,7 +9,7 @@ import unittest
 from pydantic import ValidationError
 
 from forma_core.fluidics.benchmark import (
-    ChannelDimensionConstraints, DimensionRange, FluidicBenchmarkSpec, score_fluidic_system,
+    ChannelDimensionConstraints, DimensionRange, FluidicBenchmarkSpec, RequiredPath, score_fluidic_system,
 )
 from forma_core.fluidics.calculations import (
     FlowCalculationError, average_velocity_mm_s, channel_volume_ul,
@@ -366,6 +366,91 @@ class FluidicTests(unittest.TestCase):
                                  str(EXAMPLES / "broken-missing-outlet.json")], cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(1, result.returncode, result.stderr)
         self.assertFalse(json.loads(result.stdout)["is_valid"])
+
+
+class GenericFluidicTests(unittest.TestCase):
+    def setUp(self) -> None:
+        examples = ROOT / "examples" / "fluidics"
+        self.project = HardwareIntermediateRepresentation.model_validate_json(
+            (examples / "liquid-transfer.json").read_text()
+        )
+        self.system = self.project.fluidic_system
+        assert self.system is not None
+        self.spec = FluidicBenchmarkSpec.model_validate_json(
+            (examples / "liquid-transfer-spec.json").read_text()
+        )
+
+    def test_liquid_transfer_needs_no_membrane_or_waste(self) -> None:
+        self.assertEqual([], self.system.membranes)
+        self.assertEqual("product", self.system.outlets[0].kind)
+        self.assertEqual([], validate_project(self.project))
+        self.assertTrue(score_fluidic_system(self.project.model_dump(), self.spec).passed)
+        self.assertEqual(self.project, HardwareIntermediateRepresentation.model_validate_json(self.project.model_dump_json()))
+
+    def test_task_requirements_are_optional_but_core_validation_still_applies(self) -> None:
+        spec = FluidicBenchmarkSpec()
+        self.assertTrue(score_fluidic_system(self.system, spec).passed)
+        self.system.channels[0].source_id = "missing_tank"
+        result = score_fluidic_system(self.system, spec)
+        self.assertFalse(result.passed)
+        self.assertTrue(any(issue.code == "unknown_node" for issue in result.issues))
+        self.assertFalse(score_fluidic_system({}, spec).passed)
+
+    def test_requested_outlet_kind_is_explicit(self) -> None:
+        for kind in ("product", "waste", "exhaust"):
+            with self.subTest(kind=kind):
+                self.system.outlets[0].kind = kind
+                generic = FluidicBenchmarkSpec(required_paths=[
+                    RequiredPath(source_id="feed_tank", target_id="collection"),
+                ])
+                self.assertTrue(score_fluidic_system(self.system, generic).passed)
+                self.assertEqual(kind == "product", score_fluidic_system(self.system, self.spec).checks["requested_paths"])
+
+    def test_requested_paths_can_reference_internal_nodes(self) -> None:
+        spec = FluidicBenchmarkSpec(required_paths=[
+            RequiredPath(source_id="feed_tank", target_id="transfer_pump"),
+            RequiredPath(source_id="transfer_pump", target_id="collection"),
+        ])
+        self.assertTrue(score_fluidic_system(self.system, spec).passed)
+        spec.required_paths[0].outlet_kind = "product"
+        self.assertFalse(score_fluidic_system(self.system, spec).checks["requested_paths"])
+        spec.required_paths[0].outlet_kind = None
+        spec.required_paths[0].target_id = "missing_pump"
+        self.assertFalse(score_fluidic_system(self.system, spec).checks["requested_paths"])
+
+    def test_legacy_waste_paths_keep_their_requirement_and_round_trip(self) -> None:
+        spec = FluidicBenchmarkSpec.model_validate({
+            "required_paths": [{"source_id": "feed_tank", "waste_id": "collection"}],
+        })
+        path = spec.required_paths[0]
+        self.assertEqual("collection", path.target_id)
+        self.assertEqual("collection", path.waste_id)
+        self.assertEqual("waste", path.outlet_kind)
+        self.assertFalse(score_fluidic_system(self.system, spec).passed)
+        self.system.outlets[0].kind = "waste"
+        self.assertTrue(score_fluidic_system(self.system, spec).passed)
+        self.assertEqual(spec, FluidicBenchmarkSpec.model_validate_json(spec.model_dump_json()))
+        for extra in ({"target_id": "different"}, {"outlet_kind": "product"}):
+            with self.subTest(extra=extra), self.assertRaises(ValidationError):
+                RequiredPath.model_validate({"source_id": "feed_tank", "waste_id": "collection", **extra})
+
+    def test_optional_membranes_are_still_checked_when_present(self) -> None:
+        system = organ_on_chip_system()
+        system.membranes[0].side_a_id = "missing_channel"
+        result = score_fluidic_system(system, FluidicBenchmarkSpec())
+        self.assertFalse(result.passed)
+        self.assertFalse(result.checks["membranes"])
+
+    def test_rectangular_flow_calculations_are_not_limited_to_microchannels(self) -> None:
+        channel, fluid = self.system.channels[0], self.system.fluids[0]
+        self.assertEqual(50, cross_sectional_area_mm2(channel))
+        self.assertEqual(2, average_velocity_mm_s(channel))
+        self.assertEqual(500, residence_time_s(channel))
+        self.assertAlmostEqual(40 / 3, reynolds_number(channel, fluid))
+        self.assertGreater(pressure_drop_kpa(channel, fluid), 0)
+        channel.target_flow_rate_ul_min = 1e7
+        with self.assertRaisesRegex(FlowCalculationError, "Reynolds"):
+            pressure_drop_kpa(channel, fluid)
 
 
 if __name__ == "__main__":

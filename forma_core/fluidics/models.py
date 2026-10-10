@@ -1,4 +1,4 @@
-"""Temporary, additive fluid network contract for the organ-on-a-chip MVP."""
+"""Reusable fluid-network primitives behind an additive Hardware IR boundary."""
 
 from __future__ import annotations
 

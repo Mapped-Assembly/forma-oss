@@ -2,15 +2,18 @@
   "required_paths": [
     {
       "source_id": "vascular_inlet",
-      "waste_id": "vascular_waste"
+      "target_id": "vascular_waste",
+      "outlet_kind": "waste"
     },
     {
       "source_id": "epithelial_inlet",
-      "waste_id": "epithelial_waste"
+      "target_id": "epithelial_waste",
+      "outlet_kind": "waste"
     },
     {
       "source_id": "dose_inlet",
-      "waste_id": "vascular_waste"
+      "target_id": "vascular_waste",
+      "outlet_kind": "waste"
     }
   ],
   "expected_flow_rates_ul_min": {

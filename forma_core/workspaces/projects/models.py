@@ -544,7 +544,7 @@ class HardwareIntermediateRepresentation(BaseModel):
     pin_mappings: List[PinMappingEntry] = Field(default_factory=list, description="MCU functional pin map")
     assembly: List[AssemblyStep] = Field(default_factory=list, description="Step-by-step physical build instruction package")
     mechanical: Optional[MechanicalNotes] = Field(None, description="Enclosure and fabrications specifications")
-    fluidic_system: FluidicSystem | None = Field(None, description="Temporary fluid-network MVP: channels, chambers, pumps, valves, isolated circuits and membrane interfaces.")
+    fluidic_system: FluidicSystem | None = Field(None, description="Optional fluid network: channels, chambers, reservoirs, pumps, valves, outlets and optional membrane interfaces.")
     cad_model: Optional[Any] = Field(
         None,
         description=(

@@ -884,14 +884,17 @@ class WebResearchHardwarePipeline:
         External source research context:
         {research_context}
 
-        For organ-on-a-chip or liquid microchannel requests, populate fluidic_system with the complete
+        For requests involving fluid transport or liquid handling, populate fluidic_system with the complete
         nominal open-valve network. Use directed channels connecting declared inlet/outlet, reservoir,
-        pump, valve or chamber nodes. Assign distinct circuit_id values to separated fluid circuits.
-        Represent a porous interface using membranes (channel/chamber references), never a bulk-flow
-        channel between circuits. Chamber inlet_ids/outlet_ids are incident channel IDs. Include each
-        requested flow and a reachable waste outlet per circuit. Add an independent dosing inlet only
-        when requested, joining the intended circuit; conserve summed flow downstream. Supply explicit
-        fluid properties with provenance for pressure estimates; do not invent unknown properties.
+        pump, valve or chamber nodes as needed for the requested design. Assign distinct circuit_id
+        values to separated fluid circuits; use the same circuit for intentional bulk-fluid mixing.
+        If the design requires a porous interface, represent it using membranes (channel/chamber
+        references), never a bulk-flow channel between isolated circuits. Chamber inlet_ids/outlet_ids
+        are incident channel IDs. Include supplied flow constraints and complete paths to outlets of
+        the appropriate kind (product, waste or exhaust), or waste reservoirs. Additional inlets,
+        membranes, dimensions and outlet kinds must follow the user requirements, not a fixed template.
+        Conserve summed flow downstream of mixing nodes. Supply explicit fluid properties with
+        provenance for pressure estimates; do not invent unknown properties.
         Leave fluidic_system null for projects without fluidics. This is a research design contract,
         not a CFD, biological or clinical validation.
 
