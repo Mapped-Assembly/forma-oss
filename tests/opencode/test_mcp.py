@@ -27,6 +27,20 @@ from tests.opencode.test_outcomes import wired_project
 
 
 class OpenCodeMcpModelTests(unittest.TestCase):
+    def test_fluidics_are_in_authoring_schema_and_cannot_bypass_validation(self) -> None:
+        from apps.api.opencode_mcp import _validation_result
+        from forma_core.fluidics.examples import organ_on_chip_system
+
+        project = HardwareIntermediateRepresentation(fluidic_system=organ_on_chip_system())
+        self.assertTrue(_validation_result(project)["is_valid"])
+        project.fluidic_system.channels[2].target_id = "missing_waste"
+        result = _validation_result(project)
+        self.assertFalse(result["is_valid"])
+        self.assertTrue(any(i["category"] == "Fluidics: unknown_node" for i in result["issues"]))
+        for tool in opencode_mcp_tools():
+            if tool["name"] == "forma.opencode.compile_project":
+                self.assertIn("fluidic_system", tool["inputSchema"]["properties"]["project_ir"]["description"])
+
     def test_tool_parameters_do_not_depend_on_provider_reference_support(self) -> None:
         def check(value):
             self.assertIn(value["type"], {"object", "array", "string", "number", "integer", "boolean"})
@@ -361,7 +375,7 @@ class OpenCodeMcpHttpTests(unittest.TestCase):
                 self.assertEqual(-32602, response.json()["error"]["code"])
 
     def test_allowed_tool_retains_typed_arguments_with_metadata(self) -> None:
-        with patch("apps.api.opencode_mcp.validate_circuit", return_value=[]) as validate:
+        with patch("apps.api.opencode_mcp.validate_project", return_value=[]) as validate:
             response = self.client.post("/api/opencode/mcp", json={
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {

@@ -85,7 +85,7 @@ from forma_core.user_integrations import UserIntegrationStore, default_integrati
 from apps.api.storage import get_image_storage_config, upload_image_to_supabase_s3
 from apps.api.security import MAX_IMAGE_ENCODED_CHARS, consume_operation_limit, security_config, validate_image_limits
 from forma_core.utils import generate_mermaid_chart, generate_svg_schematic
-from forma_core.validation import build_validation_summary, validate_circuit
+from forma_core.validation import build_validation_summary, validate_circuit, validate_project
 
 
 logger = logging.getLogger(__name__)
@@ -2474,7 +2474,7 @@ async def _call_mcp_tool(
 ) -> Dict[str, Any]:
     if tool_name == "forma.compile_project":
         project = HardwareIntermediateRepresentation.model_validate(arguments.get("project_ir"))
-        issues = validate_circuit(project.components, project.nets, project.requirements)
+        issues = validate_project(project)
         project.validation = build_validation_summary(issues)
         project.is_valid = not project.validation.critical
         requested_project_id = arguments.get("project_id") or (project.assembly_metadata or {}).get("project_id")

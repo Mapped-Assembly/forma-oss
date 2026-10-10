@@ -1,0 +1,30 @@
+name: Fluidic system MVP
+
+on:
+  pull_request:
+    paths:
+      - "forma_core/**"
+      - "apps/api/a2a.py"
+      - "apps/api/opencode_mcp.py"
+      - "examples/organ-on-chip/**"
+      - "tests/projects/test_fluidics*.py"
+      - "tests/agents/test_generation_stages.py"
+      - "tests/agents/test_validation_worker.py"
+      - "tests/opencode/test_mcp.py"
+      - ".github/workflows/fluidics.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  fluidics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r apps/api/requirements.txt -e . pytest
+      - run: python -m pytest tests/projects/test_fluidics.py tests/projects/test_component_instances.py tests/agents/test_generation_stages.py tests/agents/test_validation_worker.py tests/opencode/test_mcp.py -q
+      - run: python -m forma_core.fluidics.benchmark examples/organ-on-chip/two-channel.json --spec examples/organ-on-chip/two-channel-spec.json

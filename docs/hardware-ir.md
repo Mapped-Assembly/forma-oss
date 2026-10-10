@@ -23,6 +23,7 @@ The core schema lives in `forma_core/workspaces/projects/models.py` and includes
 - **pin_mappings** – `PinMappingEntry` for MCU signal mapping.
 - **assembly** – ordered `AssemblyStep` list.
 - **mechanical** – `MechanicalNotes` for enclosure and fabrication.
+- **fluidic_system** – optional milestone-scoped `FluidicSystem` for channels, chambers, pumps, valves and isolated membrane interfaces; see [fluidics](fluidics.md).
 - **constraints** – extra design constraints and notes.
 - **power_rails** – summarized `PowerRail` entries.
 - **estimated_current_draw_ma** – rough peak current estimate.

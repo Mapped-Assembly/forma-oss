@@ -4,7 +4,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from forma_core.validation import validate_circuit
 from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 
 
@@ -22,7 +21,10 @@ class DesignOutcome(BaseModel):
 
 def evaluate_design_outcome(project: HardwareIntermediateRepresentation) -> DesignOutcome:
     """Complete means populated and deterministically valid, not physically verified."""
-    issues = validate_circuit(project.components, project.nets, project.requirements)
+    # This module is also loaded during project-model package initialization.
+    from forma_core.validation import validate_project
+
+    issues = validate_project(project)
     critical = sum(issue.severity.upper() == "CRITICAL" for issue in issues)
     warnings = sum(issue.severity.upper() == "WARNING" for issue in issues)
     pins = sum(len(component.pins) for component in project.components)

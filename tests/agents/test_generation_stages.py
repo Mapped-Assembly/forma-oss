@@ -132,6 +132,32 @@ class GenerationStageRunTests(unittest.TestCase):
 
 
 class WebResearchPartialGenerationTests(unittest.TestCase):
+    def test_fluidic_plan_survives_checkpoints_and_invalid_topology_blocks_validity(self) -> None:
+        from forma_core.fluidics.examples import organ_on_chip_system
+
+        for broken in (False, True):
+            with self.subTest(broken=broken):
+                pipeline, saved = self.pipeline()
+                plan = project_plan()
+                plan.fluidic_system = organ_on_chip_system()
+                if broken:
+                    plan.fluidic_system.channels[2].target_id = "missing_waste"
+                pipeline._plan_project = lambda *args: plan
+                pipeline._wire_project = lambda *args: WiringWrapper(nets=[
+                    ConnectionNet(net_id=pin_id, name=pin_id, net_type=net_type, pins=[
+                        PinReference(ref_des=ref, pin_id=pin_id) for ref in ("U1", "J1")
+                    ]) for pin_id, net_type in (("VCC", "Power"), ("GND", "Ground"))
+                ], pin_mappings=[])
+                ir = pipeline._generate_staged_project(
+                    "Build a research organ-on-a-chip", image_bytes=None, image_mime_type=None,
+                    model_validation=self.model_validation(),
+                )
+                self.assertEqual(plan.fluidic_system, ir.fluidic_system)
+                self.assertEqual(not broken, ir.is_valid)
+                self.assertEqual(plan.fluidic_system.model_dump(mode="json"), saved[-1]["fluidic_system"])
+                if broken:
+                    self.assertTrue(any(i.category == "Fluidics: unknown_node" for i in ir.validation.critical))
+
     def pipeline(self) -> tuple[WebResearchHardwarePipeline, list[dict]]:
         pipeline = WebResearchHardwarePipeline.__new__(WebResearchHardwarePipeline)
         pipeline.runtime_config = SimpleNamespace(

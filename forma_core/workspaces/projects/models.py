@@ -4,6 +4,7 @@ from datetime import datetime
 import re
 from forma_core.workspaces.projects.mechanism_benchmarks import MechanismBenchmark
 from forma_core.workspaces.projects.solid_cad import CadOperation
+from forma_core.fluidics.models import FluidicSystem
 
 # ==========================================
 # 1. Base / Seed Component Database Schemas
@@ -543,6 +544,7 @@ class HardwareIntermediateRepresentation(BaseModel):
     pin_mappings: List[PinMappingEntry] = Field(default_factory=list, description="MCU functional pin map")
     assembly: List[AssemblyStep] = Field(default_factory=list, description="Step-by-step physical build instruction package")
     mechanical: Optional[MechanicalNotes] = Field(None, description="Enclosure and fabrications specifications")
+    fluidic_system: FluidicSystem | None = Field(None, description="Temporary fluid-network MVP: channels, chambers, pumps, valves, isolated circuits and membrane interfaces.")
     cad_model: Optional[Any] = Field(
         None,
         description=(

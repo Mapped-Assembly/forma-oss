@@ -32,6 +32,15 @@ class StoredProjectArtifact:
     content: bytes | None = None
 
 
+def _local_content_matches(target: Path, content: bytes) -> bool:
+    """Prove that a content-addressed put is already satisfied, or require a write."""
+    try:
+        return target.stat().st_size == len(content) and target.read_bytes() == content
+    except OSError:
+        # Missing or unreadable content cannot establish a successful put.
+        return False
+
+
 def _storage_backend() -> str:
     configured = (config.optional("FORMA_CLI_ARTIFACT_STORAGE_BACKEND") or "").lower()
     aliases = {
@@ -173,15 +182,24 @@ class ProjectArtifactStorage:
         if backend == "local":
             target = Path(self.config["directory"]) / Path(*key.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
-            # Each writer needs its own temporary file; identical concurrent puts
-            # previously raced over one .tmp path and could lose a successful write.
-            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
-                temporary = Path(handle.name)
-                handle.write(content)
-            try:
-                temporary.replace(target)
-            finally:
-                temporary.unlink(missing_ok=True)
+            if not _local_content_matches(target, content):
+                # Give each writer its own file, and close it before publication.
+                temporary: Path | None = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                        temporary = Path(handle.name)
+                        handle.write(content)
+                    try:
+                        temporary.replace(target)
+                    except PermissionError:
+                        # A concurrent identical put may have won while a reader
+                        # holds its target open (Windows denies replacement).
+                        # Accept only verified bytes, never mere file existence.
+                        if not _local_content_matches(target, content):
+                            raise
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
         elif backend == "supabase":
             bucket = self._supabase_bucket()
             options = {

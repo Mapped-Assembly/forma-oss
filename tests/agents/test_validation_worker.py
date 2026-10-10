@@ -75,6 +75,18 @@ class CountingValidationEngine:
 
 
 class ValidationWorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_fluidic_consistency_is_checked_on_canonical_revisions(self) -> None:
+        from forma_core.fluidics.examples import organ_on_chip_system
+        from forma_core.workspaces.validation import evaluate_project_revision
+
+        self.revision.state.fluidic_system = organ_on_chip_system()
+        for broken in (False, True):
+            if broken:
+                self.revision.state.fluidic_system.channels[2].target_id = "missing_waste"
+            report = evaluate_project_revision(self.revision, self.brief, ["consistency"])
+            finding = next(f for f in report.findings if f.criterion_id == "consistency:fluidic-system")
+            self.assertEqual(ValidationCheckStatus.FAILED if broken else ValidationCheckStatus.PASSED, finding.status)
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.provider = create_sqlite_provider(
