@@ -1,17 +1,16 @@
-# FluidicSystem hackathon MVP
+# Reusable fluid systems
 
-Issue [#3](https://github.com/Mapped-Assembly/forma-oss/issues/3) adds one optional
-`fluidic_system` field to `HardwareIntermediateRepresentation`. The IR name,
-version, mechanical/electrical fields and serialization remain unchanged.
-Payloads that omit the field still work. This milestone-scoped contract informs
-the future architecture work in #2; it does not implement that refactor.
+`FluidicSystem` describes reusable fluid-network components, connectivity and
+operating constraints. Liquid transfer, mixing and microfluidic organ-on-a-chip
+designs compose the same primitives and use the same deterministic validator.
+Membranes, separate circuits, waste collection and specific channel sizes are
+design requirements supplied by the task, not prerequisites for every network.
 
-![Two-channel organ-chip flow schematic](assets/organ-on-chip-flow.gif)
-
-The GIF is an exploded schematic rendered from the checked example JSON. It is
-not a CAD export or CFD result. Channel tracers move at the declared flow divided
-by channel cross-sectional area; layer gaps, chambers, cells and external tubing
-are illustrative. No membrane transport or biological response is simulated.
+Issue [#3](https://github.com/Mapped-Assembly/forma-oss/issues/3) introduced the
+optional `fluidic_system` boundary in `HardwareIntermediateRepresentation` for
+the hackathon milestone. Payloads that omit it still work. The existing IR name,
+mechanical/electrical schema and exporters remain unchanged; the broader IR
+architecture in #2 is separate future work.
 
 ## Use the contract
 
@@ -19,11 +18,13 @@ Models, graph traversal, validation, calculations, examples and scoring live in
 `forma_core/fluidics/`. Import the typed models from `forma_core.fluidics.models`.
 
 ```python
-from forma_core.fluidics.examples import organ_on_chip_system
+from pathlib import Path
 from forma_core.validation import validate_project
 from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 
-project = HardwareIntermediateRepresentation(fluidic_system=organ_on_chip_system())
+project = HardwareIntermediateRepresentation.model_validate_json(
+    Path("examples/fluidics/liquid-transfer.json").read_text()
+)
 issues = validate_project(project)  # electrical checks plus optional fluidics
 assert not issues
 assert HardwareIntermediateRepresentation.model_validate_json(project.model_dump_json()) == project
@@ -76,6 +77,11 @@ flows are not solved. A zero target is representable in the structural network;
 it does not imply active perfusion or a finite residence time. Valve control,
 pump head curves, reservoir accumulation and transient operation are out of scope.
 
+The current topology contract covers directed networks with sources and terminal
+outlets. A fully closed circulating loop without a source/sink boundary is not
+supported by this MVP. General-purpose primitives do not imply support for every
+flow configuration or physical regime.
+
 ## Physical estimates
 
 The helpers operate on a rectangular channel with an explicitly supplied target
@@ -98,6 +104,9 @@ negligible. Assumptions are steady, fully developed, incompressible laminar flow
 in rigid, straight, constant-section channels. No branch pressure solve, minor
 losses, PDMS deformation, membrane leakage or biological validation is provided.
 The rectangular pressure approximation is less accurate near square sections.
+There is no hard-coded microscopic size range. The mm and µL units are explicit
+storage conventions; validity of the physical approximation depends on geometry
+and flow assumptions, including Reynolds number, rather than the application name.
 
 `max_pressure_kpa` is a **channel differential-pressure budget**, not an absolute
 pressure rating or a pump-head limit. If it is supplied, insufficient inputs or
@@ -112,6 +121,18 @@ Sources for the approximations and limitations:
 
 ## Examples and benchmark
 
+`examples/fluidics/liquid-transfer.json` represents a 1 L supply tank feeding a
+pump and product-collection outlet through two 1 m rectangular channels with
+10 × 5 mm sections at 6 mL/min. It has no membrane, tissue region, required waste
+outlet or microfluidic-specific validation. Its external specification requests
+the product path, flow and geometry. Fluid properties are explicitly labeled as
+demonstration inputs. Run the same validator and scorer used by every example:
+
+```sh
+python -m forma_core validate examples/fluidics/liquid-transfer.json
+python -m forma_core.fluidics.benchmark examples/fluidics/liquid-transfer.json --spec examples/fluidics/liquid-transfer-spec.json
+```
+
 `examples/organ-on-chip/` contains full Hardware IR JSON, separate task
 specifications, and an intentionally broken network:
 
@@ -121,6 +142,14 @@ specifications, and an intentionally broken network:
   vascular chamber; the vascular outlet channel carries the summed 35 µL/min.
 - `broken-missing-outlet.json`: vascular channel points at an undeclared waste
   endpoint and must fail.
+
+![Two-channel organ-chip flow schematic](assets/organ-on-chip-flow.gif)
+
+This application-specific GIF is an exploded schematic rendered from the checked
+example JSON. It is not a CAD export or CFD result. Channel tracers move at the
+declared flow divided by channel cross-sectional area; layer gaps, chambers,
+cells and external tubing are illustrative. No membrane transport or biological
+response is simulated.
 
 Run from the repository root after installing Forma's Python dependencies:
 
@@ -135,9 +164,32 @@ python scripts/media/render_fluidic_demo.py --output docs/assets/organ-on-chip-f
 
 The broken example exits 1. Scoring accepts a raw network dictionary or full IR
 dictionary and returns named checks, findings, `passed`, and an equally weighted
-score in [0,1]. The external spec fixes required source-to-waste paths, channel
-flow targets and membrane-separated pairs. Optional requirements also check
-channel count and dimensions:
+score in [0,1]. Every task requirement is optional: `required_paths`,
+`expected_flow_rates_ul_min`, `required_membranes`, `expected_channel_count` and
+`channel_dimensions`. An empty specification checks the declared network's
+consistency only; it does not establish compliance with any application brief.
+An omitted requirement imposes no restriction in its named check. Core schema,
+topology and supplied operating constraints are always checked, including any
+membranes that are actually declared.
+
+Paths use `source_id` and `target_id`, which may identify any declared nodes.
+Optionally require an endpoint kind with `outlet_kind` (`product`, `waste` or
+`exhaust`). Waste reservoirs also satisfy `outlet_kind="waste"`. For example:
+
+```json
+{
+  "required_paths": [
+    {"source_id": "feed_tank", "target_id": "collection", "outlet_kind": "product"}
+  ]
+}
+```
+
+Legacy `waste_id` inputs remain readable and still require a waste endpoint;
+canonical serialization writes `target_id` and `outlet_kind="waste"`. Conflicting
+legacy and canonical constraints are rejected. The organ-chip specifications
+explicitly request waste paths and membrane-separated pairs. The general transfer
+specification explicitly requests product collection and no membrane requirement.
+Channel count and dimension requirements are likewise supplied by the task:
 
 ```json
 {
@@ -152,8 +204,7 @@ channel count and dimensions:
 }
 ```
 
-Add these fields alongside `required_paths`, `expected_flow_rates_ul_min` and
-`required_membranes`. All dimension bounds are inclusive, finite, positive mm
+Add only the fields needed by the task. All dimension bounds are inclusive, finite, positive mm
 values; a range may supply just a minimum or maximum. Empty/inverted ranges and
 non-integer counts are rejected. Missing constrained channel IDs fail the check.
 Findings identify the offending channel and dimension, including its value and

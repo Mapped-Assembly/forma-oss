@@ -1,4 +1,4 @@
-"""Offline, deterministic scoring against an external organ-chip specification."""
+"""Offline, deterministic scoring against external fluid-system requirements."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -16,10 +16,31 @@ from .validation import FluidicIssue, validate_fluidic_system
 
 
 class RequiredPath(FluidicModel):
-    """Task-required directed path from a boundary source to a waste endpoint."""
+    """Requested directed node-to-node path, optionally ending at an outlet kind."""
 
     source_id: Identifier
-    waste_id: Identifier
+    target_id: Identifier
+    outlet_kind: Literal["waste", "product", "exhaust"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_waste_path(cls, value: Any) -> Any:
+        """Read the original waste_id contract without weakening its semantics."""
+        if not isinstance(value, dict) or "waste_id" not in value:
+            return value
+        payload = dict(value)
+        waste_id = payload.pop("waste_id")
+        if "target_id" in payload and payload["target_id"] != waste_id:
+            raise ValueError("target_id and legacy waste_id must identify the same node.")
+        if payload.get("outlet_kind") not in (None, "waste"):
+            raise ValueError("Legacy waste_id requires outlet_kind='waste'.")
+        payload.update(target_id=waste_id, outlet_kind="waste")
+        return payload
+
+    @property
+    def waste_id(self) -> str | None:
+        """Compatibility accessor for callers using the original waste-only API."""
+        return self.target_id if self.outlet_kind == "waste" else None
 
 
 class RequiredMembrane(FluidicModel):
@@ -69,9 +90,9 @@ class ChannelDimensionConstraints(FluidicModel):
 class FluidicBenchmarkSpec(FluidicModel):
     """Requirements come from the task, never inferred from the candidate itself."""
 
-    required_paths: list[RequiredPath] = Field(min_length=1)
-    expected_flow_rates_ul_min: dict[Identifier, NonNegative] = Field(min_length=1)
-    required_membranes: list[RequiredMembrane] = Field(min_length=1)
+    required_paths: list[RequiredPath] = Field(default_factory=list)
+    expected_flow_rates_ul_min: dict[Identifier, NonNegative] = Field(default_factory=dict)
+    required_membranes: list[RequiredMembrane] = Field(default_factory=list)
     expected_channel_count: int | None = Field(
         None, ge=1, strict=True, description="Exact number of all declared channel segments, including feed tubing.",
     )
@@ -121,10 +142,12 @@ def score_fluidic_system(payload: Any, spec: FluidicBenchmarkSpec) -> FluidicBen
     checks["flow_constraints"] = not flow_codes
     checks["pressure_constraints"] = not pressure_codes
     graph = build_topology(system)
-    wastes = {o.id for o in system.outlets if o.kind == "waste"} | {r.id for r in system.reservoirs if r.role == "waste"}
+    outlet_kinds = {outlet.id: outlet.kind for outlet in system.outlets}
+    outlet_kinds.update({r.id: "waste" for r in system.reservoirs if r.role == "waste"})
     checks["requested_paths"] = all(
-        path.source_id in graph.sources and path.waste_id in wastes
-        and path.waste_id in reachable(graph.forward, {path.source_id})
+        path.source_id in graph.nodes and path.target_id in graph.nodes
+        and path.target_id in reachable(graph.forward, {path.source_id})
+        and (path.outlet_kind is None or outlet_kinds.get(path.target_id) == path.outlet_kind)
         for path in spec.required_paths
     )
     channels = {c.id: c for c in system.channels}
