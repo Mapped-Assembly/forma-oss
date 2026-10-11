@@ -6,6 +6,7 @@ import unittest
 from pydantic import ValidationError
 
 from forma_core.biology import BiologicalExperiment, validate_biological_experiment
+from forma_core.biology.benchmark import evaluate_biological_scenario
 from forma_core.workspaces.projects.models import HardwareIntermediateRepresentation
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +36,19 @@ class BiologicalExperimentTests(unittest.TestCase):
             [],
             validate_biological_experiment(self.experiment, self.project.fluidic_system),
         )
+
+    def test_integrated_scenario_reports_physical_and_biological_validity(self) -> None:
+        result = evaluate_biological_scenario(self.experiment, self.project)
+        self.assertTrue(result["passed"])
+        self.assertEqual([], result["fluidic_issues"])
+        self.assertEqual([], result["biological_issues"])
+        self.assertEqual(2, result["counts"]["compartments"])
+        self.assertEqual(1, result["counts"]["reference_outcomes"])
+        self.assertEqual({
+            "toxicity_prediction": False,
+            "biological_simulation": False,
+            "clinical_safety_assessment": False,
+        }, result["claims"])
 
     def test_missing_fluidic_context_is_explicit(self) -> None:
         issues = validate_biological_experiment(self.experiment)
