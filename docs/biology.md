@@ -119,6 +119,58 @@ unknown record IDs fail closed instead of silently computing a partial result.
 Unit tests use synthetic predictions only to verify scorer math; those test values
 must never be presented as model performance.
 
+### Reference baseline v0
+
+The first reproducible comparison point is intentionally simple: the **FDA DILIrank
+SeverityClass reference baseline**. It uses no learned parameters and never reads
+DILIst labels while generating predictions:
+
+- score = `SeverityClass / 8`
+- predicted DILI-positive when `SeverityClass >= 5`
+- fixed threshold = 5
+
+Generate and score it with:
+
+```sh
+python -m forma_core.biology.liverbench_baselines \
+  examples/biology/liverbench-v0.json \
+  --baseline dilirank-severity-v0 \
+  --split heldout
+```
+
+The checked prediction bundle is
+`examples/biology/liverbench-v0-dilirank-severity-baseline.json`, and the standard
+LiverBench scorer can evaluate it directly:
+
+```sh
+python -m forma_core.biology.liverbench \
+  examples/biology/liverbench-v0.json \
+  --predictions examples/biology/liverbench-v0-dilirank-severity-baseline.json \
+  --split heldout
+```
+
+Expected held-out results for the six v0 compounds are:
+
+| Metric | Result |
+| --- | ---: |
+| Sensitivity | 0.667 |
+| Specificity | 0.667 |
+| False-negative rate | 0.333 |
+| Accuracy | 0.667 |
+| Balanced accuracy | 0.667 |
+| AUROC | 0.889 |
+
+The confusion matrix is `TP=2, TN=2, FP=1, FN=1`. The two errors are the two held-out
+challenge records: simvastatin (DILIst-positive with DILIrank SeverityClass 3) and
+zolpidem (DILIst-negative with SeverityClass 7). A constant-negative no-skill floor
+has held-out balanced accuracy 0.5 and AUROC 0.5.
+
+This baseline is **not independent biological validation**. FDA states that DILIst
+was created by augmenting DILIrank with additional literature datasets, so the two
+sources are related. Treat these numbers as a transparent reference/sanity floor,
+not as organ-on-chip predictive performance. Independent biological-response data
+or wet-lab measurements are still required for a stronger scientific claim.
+
 FDA source pages:
 
 - https://www.fda.gov/science-research/liver-toxicity-knowledge-base-ltkb/drug-induced-liver-injury-rank-dilirank-20-dataset
