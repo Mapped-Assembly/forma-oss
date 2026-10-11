@@ -34,6 +34,7 @@ class DatasetReference(BiologyModel):
     version: Text | None = None
     license: Text | None = None
     citation: Text | None = None
+    sha256: str | None = Field(None, pattern=r"^[a-f0-9]{64}$")
     notes: Text | None = None
 
 
@@ -109,6 +110,12 @@ class BiologicalObservation(BiologyModel):
     endpoint_id: Identifier
     compartment_id: Identifier
     time_h: NonNegative
+    compound_identifier: Text | None = None
+    dose_value: NonNegative | None = None
+    dose_unit: Text | None = None
+    measurement_status: Literal["observed", "missing"] = "observed"
+    missing_reason: Text | None = None
+    source_missing_marker: Text | None = None
     numeric_value: float | None = Field(None, allow_inf_nan=False)
     categorical_value: Text | None = None
     unit: Text | None = None
@@ -118,10 +125,20 @@ class BiologicalObservation(BiologyModel):
 
     @model_validator(mode="after")
     def exactly_one_value(self) -> "BiologicalObservation":
-        """Require one unambiguous observed value representation."""
+        """Validate observed or explicitly missing values and paired dose metadata."""
         values = (self.numeric_value is not None, self.categorical_value is not None)
-        if sum(values) != 1:
-            raise ValueError("BiologicalObservation requires exactly one numeric_value or categorical_value.")
+        if self.measurement_status == "missing":
+            if any(values) or self.missing_reason is None:
+                raise ValueError("Missing observations require a reason and no measured value.")
+        else:
+            if sum(values) != 1:
+                raise ValueError("BiologicalObservation requires exactly one numeric_value or categorical_value.")
+            if self.missing_reason is not None or self.source_missing_marker is not None:
+                raise ValueError("Observed values cannot carry missing-value metadata.")
+        if (self.dose_value is None) != (self.dose_unit is None):
+            raise ValueError("Observation dose_value and dose_unit must be supplied together.")
+        if self.dose_value is not None and self.compound_identifier is None:
+            raise ValueError("Dose metadata requires a compound_identifier.")
         return self
 
 

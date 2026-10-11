@@ -57,6 +57,62 @@ links and emits JSON suitable for CI or a demo. Its `claims` block is deliberate
 explicit that toxicity prediction, biological simulation and clinical safety
 assessment are false for this milestone.
 
+## Published evidence workflow
+
+Select a compound and export its published evidence as a validated experiment:
+
+```sh
+python -m forma_core.biology.liverchip_evidence \
+  examples/biology/ewart-liverchip-v0.json \
+  --compound Troglitazone \
+  --template examples/organ-on-chip/liver-dili-biological.json \
+  --project examples/organ-on-chip/two-channel.json \
+  --output /tmp/troglitazone-evidence.json \
+  --experiment-output /tmp/troglitazone-experiment.json
+```
+
+The report contains dose-response means and descriptive SEM, raw observations,
+source hashes and row references, published margins, missing-data flags, and
+physical/interface validation. `evidence.status` is independent of
+`validation.passed`: structural validity does not establish evidence availability
+or drug safety. `complete` means no missing numerical entries among the supplied
+response rows, not complete biological evidence.
+
+Response data are available for Clozapine, Olanzapine, Troglitazone, Pioglitazone,
+Trovafloxacin and Levofloxacin. Other compounds in the 27-compound manifest retain
+their published margins and reference labels but report `unavailable` response
+evidence. Unknown names fail with exit code 2; names and IDs match exactly apart
+from case and outer whitespace. Broken physical mappings return exit code 1.
+A valid report, including one reporting unavailable evidence, returns zero.
+
+The checked-in `examples/organ-on-chip/liver-dili-ewart-biological.json` demonstrates
+Troglitazone: **36 source rows, 32 numerical measurements, four missing results**.
+It also works directly with the existing interface checker:
+
+```sh
+python -m forma_core.biology.benchmark \
+  examples/organ-on-chip/liver-dili-ewart-biological.json \
+  --project examples/organ-on-chip/two-channel.json
+```
+
+Imported observations carry compound ID, dose and unit, measurement status,
+missing reason and original missing marker. `observed` records still require
+exactly one numerical or categorical value; `missing` records require a reason
+and no measured value. `DatasetReference.sha256` is optional for older datasets.
+Existing experiment files remain valid.
+
+This creates a fresh evidence scenario using the template's compartments and
+organ model. It excludes the template's illustrative acetaminophen exposure,
+controls, sampling plan and labels instead of applying them to a different drug.
+Dose is stored on observations as a human Cmax multiple. Source day 3 is encoded
+as nominal 72 hours; no exposure duration, donor ID or chip ID is invented.
+Compartment association does not imply that the Forma fixture generated the
+measurements or is equivalent to the publication's device.
+
+See [Ewart reproduction details](ewart-liverchip.md) for licensing, source
+limitations, the donor-2 discrepancy, and the corrected result that remains
+unreproduced. This workflow does not produce a new toxicity prediction.
+
 ## LiverBench v0
 
 `examples/biology/liverbench-v0.json` is a hand-audited 24-compound reference slice
