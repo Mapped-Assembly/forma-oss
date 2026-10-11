@@ -31,3 +31,4 @@ jobs:
       - run: python -m pytest tests/projects/test_fluidics.py tests/projects/test_biology.py tests/projects/test_component_instances.py tests/agents/test_generation_stages.py tests/agents/test_validation_worker.py tests/opencode/test_mcp.py -q
       - run: python -m forma_core.fluidics.benchmark examples/organ-on-chip/two-channel.json --spec examples/organ-on-chip/two-channel-spec.json
       - run: python -m forma_core.fluidics.benchmark examples/fluidics/liquid-transfer.json --spec examples/fluidics/liquid-transfer-spec.json
+      - run: python -m forma_core.biology.benchmark examples/organ-on-chip/liver-dili-biological.json --project examples/organ-on-chip/two-channel.json
