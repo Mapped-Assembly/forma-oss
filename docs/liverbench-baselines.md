@@ -102,3 +102,8 @@ predictions or relabel external hepatocyte data as Forma-generated chip data.
 Reference: Bergen et al., *A large-scale human toxicogenomics resource for
 drug-induced liver injury prediction*, Nature Communications 16, 9860 (2025),
 https://doi.org/10.1038/s41467-025-65690-3.
+
+The separate [Ewart Liver-Chip reproduction](ewart-liverchip.md) now provides
+versioned published chip margins and experimental response rows. It reproduces
+part of the publication and documents unresolved discrepancies; it does not
+satisfy the independent-predictor validation milestone above.
