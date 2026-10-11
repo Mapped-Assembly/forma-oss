@@ -84,8 +84,14 @@ def main() -> None:
     print("LIVERBENCH_COVERAGE", json.dumps(coverage, sort_keys=True))
 
     model = ToxPredictor("v1")
+    # The public validation AnnData currently has duplicate observation labels.
+    # Predict first, then assign positionally to a reset observation table so
+    # pandas cannot reindex the predictions against duplicate labels.
+    predicted = model.predict(validation)["DILI_probability"].to_numpy()
+    validation_table = validation.obs.reset_index(drop=True).copy()
+    validation_table["DILI_probability"] = predicted
     mos = model.compute_safety_margin(
-        validation,
+        validation_table,
         pert_col="compound_name",
         dose_col="dose_uM",
         cmax_col="Cmax_uM",
@@ -95,7 +101,7 @@ def main() -> None:
         retain_all_cols=True,
     )
 
-    truth = validation.obs[["compound_name", "DILI_label_binary"]].drop_duplicates("compound_name")
+    truth = validation_table[["compound_name", "DILI_label_binary"]].drop_duplicates("compound_name")
     truth_lookup = dict(zip(truth["compound_name"].astype(str), truth["DILI_label_binary"].astype(str)))
     rows = []
     for compound_name, row in mos.iterrows():
