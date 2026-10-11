@@ -1,4 +1,4 @@
-name: Fluidic system MVP
+name: Fluidic and biological experiment interface
 
 on:
   pull_request:
@@ -9,6 +9,7 @@ on:
       - "examples/organ-on-chip/**"
       - "examples/fluidics/**"
       - "tests/projects/test_fluidics*.py"
+      - "tests/projects/test_biology.py"
       - "tests/agents/test_generation_stages.py"
       - "tests/agents/test_validation_worker.py"
       - "tests/opencode/test_mcp.py"
@@ -27,6 +28,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -r apps/api/requirements.txt -e . pytest
-      - run: python -m pytest tests/projects/test_fluidics.py tests/projects/test_component_instances.py tests/agents/test_generation_stages.py tests/agents/test_validation_worker.py tests/opencode/test_mcp.py -q
+      - run: python -m pytest tests/projects/test_fluidics.py tests/projects/test_biology.py tests/projects/test_component_instances.py tests/agents/test_generation_stages.py tests/agents/test_validation_worker.py tests/opencode/test_mcp.py -q
       - run: python -m forma_core.fluidics.benchmark examples/organ-on-chip/two-channel.json --spec examples/organ-on-chip/two-channel-spec.json
       - run: python -m forma_core.fluidics.benchmark examples/fluidics/liquid-transfer.json --spec examples/fluidics/liquid-transfer-spec.json
+      - run: python -m forma_core.biology.benchmark examples/organ-on-chip/liver-dili-biological.json --project examples/organ-on-chip/two-channel.json
