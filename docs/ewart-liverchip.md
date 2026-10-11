@@ -110,3 +110,9 @@ Changes are structured transcription, the documented identity repair, explicit
 missing-value normalization, and added metadata and descriptive statistics.
 The source XML and workbooks are not bundled. Code remains under the repository's
 license. No DILImap data is included.
+
+## Use evidence in an experiment
+
+The [published evidence workflow](biology.md#published-evidence-workflow) selects
+a compound, attaches response rows to a validated biological experiment, and
+exports dose-response evidence with source provenance and missing-data flags.
