@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
-from forma_core.biology.liverbench import load_liverbench, score_predictions
+from forma_core.biology.liverbench import LiverBenchPredictions, load_liverbench, score_predictions
 from forma_core.biology.liverbench_baselines import (
     DILIRANK_SEVERITY_POSITIVE_THRESHOLD,
     build_constant_negative_baseline,
@@ -12,6 +12,7 @@ from forma_core.biology.liverbench_baselines import (
 
 ROOT = Path(__file__).resolve().parents[2]
 DATASET = ROOT / "examples" / "biology" / "liverbench-v0.json"
+REFERENCE_PREDICTIONS = ROOT / "examples" / "biology" / "liverbench-v0-dilirank-severity-baseline.json"
 
 
 class LiverBenchBaselineTests(unittest.TestCase):
@@ -27,6 +28,11 @@ class LiverBenchBaselineTests(unittest.TestCase):
                 prediction = prediction_lookup[record.id]
                 self.assertEqual(int(record.severity_class >= 5), prediction.predicted_label)
                 self.assertAlmostEqual(record.severity_class / 8, prediction.score)
+
+    def test_checked_in_prediction_bundle_matches_generator(self) -> None:
+        checked_in = LiverBenchPredictions.model_validate_json(REFERENCE_PREDICTIONS.read_text())
+        generated = build_dilirank_severity_baseline(self.dataset)
+        self.assertEqual(generated, checked_in)
 
     def test_dilirank_severity_heldout_metrics_are_reproducible(self) -> None:
         result = score_predictions(
