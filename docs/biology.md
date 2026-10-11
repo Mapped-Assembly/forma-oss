@@ -247,3 +247,9 @@ assay and dataset semantics belong in the biological/application layer. Future
 DILI prediction or digital-twin work should consume this contract and produce
 provenanced observations/predictions rather than adding hidden biological behavior
 to the fluidic validator.
+
+## Prediction task and independent evaluation
+
+See the [versioned prediction plan](liverchip-prediction-plan.md) for the measured-assay
+DILI task, candidate external panel, compound-level exclusion audit and admission
+gates. No independent chip test cohort is currently admitted.
