@@ -57,6 +57,73 @@ links and emits JSON suitable for CI or a demo. Its `claims` block is deliberate
 explicit that toxicity prediction, biological simulation and clinical safety
 assessment are false for this milestone.
 
+## LiverBench v0
+
+`examples/biology/liverbench-v0.json` is a hand-audited 24-compound reference slice
+joined across two FDA Liver Toxicity Knowledge Base resources:
+
+- DILIrank 2.0: 1,336 FDA-approved drugs ranked as `vMost`, `vLess`, `vNo` or
+  `Ambiguous-DILI-concern` on the FDA source page.
+- DILIst: 1,279 drugs with a binary human DILI classification on the FDA source
+  page (768 positive, 511 negative; 0 = negative, 1 = positive).
+
+The v0 slice is balanced 12 positive / 12 negative and split 12 train / 6 dev /
+6 heldout. It deliberately includes eight challenge records: four DILIst-positive
+drugs that are only `vLess-DILI-concern` in DILIrank, and four DILIst-negative
+records that are `Ambiguous-DILI-concern` in DILIrank. The purpose is to prevent
+the initial benchmark from containing only easy high-concern versus no-concern
+examples.
+
+Every row retains the FDA source record IDs, source compound names, DILIrank
+severity/concern, DILIst classification, route, cohort and split. The repository
+stores only this small derived manifest rather than mirroring the complete FDA
+lists.
+
+Validate the dataset and exercise all 24 records through the biological→fluidic
+interface:
+
+```sh
+python -m forma_core.biology.liverbench \
+  examples/biology/liverbench-v0.json \
+  --project examples/organ-on-chip/two-channel.json
+```
+
+That command should report interface coverage; it is **not** a toxicity-performance
+result. LiverBench itself generates no predictions.
+
+To score a real model, provide a prediction bundle:
+
+```json
+{
+  "model_name": "example-model",
+  "model_version": "commit-or-version",
+  "predictions": [
+    {"record_id": "ketoconazole", "predicted_label": 1, "score": 0.93},
+    {"record_id": "valproic-acid", "predicted_label": 1, "score": 0.87}
+  ]
+}
+```
+
+Then run, normally against the held-out split:
+
+```sh
+python -m forma_core.biology.liverbench \
+  examples/biology/liverbench-v0.json \
+  --predictions results/predictions.json \
+  --split heldout
+```
+
+Complete prediction sets report sensitivity, specificity, false-negative rate,
+accuracy, balanced accuracy and AUROC when scores are supplied. Incomplete or
+unknown record IDs fail closed instead of silently computing a partial result.
+Unit tests use synthetic predictions only to verify scorer math; those test values
+must never be presented as model performance.
+
+FDA source pages:
+
+- https://www.fda.gov/science-research/liver-toxicity-knowledge-base-ltkb/drug-induced-liver-injury-rank-dilirank-20-dataset
+- https://www.fda.gov/science-research/liver-toxicity-knowledge-base-ltkb/drug-induced-liver-injury-severity-and-toxicity-dilist-dataset
+
 ## Boundary
 
 Keep generic physical primitives in `forma_core.fluidics`. Organ, cell, compound,
