@@ -1,5 +1,16 @@
 """Biological experiment metadata layered on Forma physical-system primitives."""
 
+from .liverbench import (
+    LiverBenchDataset,
+    LiverBenchPrediction,
+    LiverBenchPredictions,
+    LiverBenchRecord,
+    build_reference_experiment,
+    dataset_summary,
+    evaluate_interface,
+    load_liverbench,
+    score_predictions,
+)
 from .models import (
     BiologicalCompartment,
     BiologicalEndpoint,
@@ -22,7 +33,16 @@ __all__ = [
     "CompoundExposure",
     "DatasetReference",
     "ExperimentalControl",
+    "LiverBenchDataset",
+    "LiverBenchPrediction",
+    "LiverBenchPredictions",
+    "LiverBenchRecord",
     "ReferenceOutcome",
     "SamplingPoint",
+    "build_reference_experiment",
+    "dataset_summary",
+    "evaluate_interface",
+    "load_liverbench",
+    "score_predictions",
     "validate_biological_experiment",
 ]
