@@ -81,6 +81,18 @@ class LiverBenchIndependentBaselineTests(unittest.TestCase):
         self.assertEqual((0, 0.0), prediction_lookup["streptomycin"])
         self.assertEqual((1, 2 / 3), prediction_lookup["zolpidem"])
 
+    def test_heldout_labels_and_dilirank_fields_do_not_change_predictions(self) -> None:
+        """Protect the molecular predictor's separation from evaluation metadata."""
+        expected = build_pubchem_knn_baseline(self.dataset, self.descriptors)
+        records = [record.model_copy(update={
+            "dilist_classification": (1 - record.dilist_classification)
+            if record.split == "heldout" else record.dilist_classification,
+            "severity_class": 8 - record.severity_class,
+            "dilirank_concern": "Ambiguous-DILI-concern",
+        }) for record in self.dataset.records]
+        changed = self.dataset.model_copy(update={"records": records})
+        self.assertEqual(expected, build_pubchem_knn_baseline(changed, self.descriptors))
+
 
 if __name__ == "__main__":
     unittest.main()

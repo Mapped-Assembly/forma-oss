@@ -176,6 +176,14 @@ FDA source pages:
 - https://www.fda.gov/science-research/liver-toxicity-knowledge-base-ltkb/drug-induced-liver-injury-rank-dilirank-20-dataset
 - https://www.fda.gov/science-research/liver-toxicity-knowledge-base-ltkb/drug-induced-liver-injury-severity-and-toxicity-dilist-dataset
 
+## Molecular and optional assay baselines
+
+See [LiverBench baseline status](liverbench-baselines.md) for the reproducible
+PubChem molecular baseline and the optional local IC10/Cmax assay adapter.
+The adapter reports missing-data abstentions and suppresses incomplete-split
+metrics. External assay data are not bundled; source licensing and coverage
+remain explicit prerequisites for independent biological evaluation.
+
 ## Boundary
 
 Keep generic physical primitives in `forma_core.fluidics`. Organ, cell, compound,
