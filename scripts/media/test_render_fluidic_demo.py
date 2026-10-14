@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from render_fluidic_demo import LEFT, RIGHT, ROOT, load_fixture, render_frame, tracer_positions
+from render_fluidic_demo import LEFT, RIGHT, ROOT, load_fixture, render_frame, tracer_positions, iso
 
 
 class FluidicPreviewTests(unittest.TestCase):
@@ -29,12 +29,17 @@ class FluidicPreviewTests(unittest.TestCase):
         circuits, membrane = load_fixture(ROOT / "examples/organ-on-chip/two-channel.json")
         image = render_frame(circuits, membrane, 1)
         background = image.getpixel((10, 10))
-        for x in (600, 800, 1000):
-            for y in range(405, 422):
-                self.assertNotEqual(image.getpixel((x, y)), background)
-        for circuit in circuits:
-            for x in (154, 235, 337, 405, 418, 509, 1111, 1200, 1273):
-                self.assertNotEqual(image.getpixel((x, round(circuit.center))), background)
+        for along in (100,300,500):
+            for z in range(61,76):
+                x,y=iso(along,0,z)
+                self.assertNotEqual(image.getpixel((round(x),round(y))), background)
+        for circuit,z in zip(circuits,(103,33)):
+            for x,y in (iso(-90,0,z),iso(600,60,z),iso(660,60,z)):
+                self.assertNotEqual(image.getpixel((round(x),round(y))), background)
+        # Orthogonal world axes have equal projected length: true isometry.
+        origin=iso(0,0,0)
+        for endpoint in (iso(1,0,0),iso(0,1,0),iso(0,0,1)):
+            self.assertAlmostEqual(sum((a-b)**2 for a,b in zip(origin,endpoint)),1)
 
     def test_unsupported_networks_fail(self) -> None:
         """The renderer refuses a missing waste endpoint and extra dosing branch."""

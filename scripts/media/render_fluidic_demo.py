@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from membrane_exchange import MembraneExchange
 
 ROOT = Path(__file__).resolve().parents[2]
-W, H, SCALE, FPS, SECONDS = 1440, 900, 2, 20, 12
+W, H, SCALE, FPS, SECONDS = 1440, 1200, 2, 20, 12
 BG, FG, MUTED = "#0c1522", "#edf3fa", "#a7b8cc"
 BLUE, CORAL, GOLD = "#62d5ff", "#ff8994", "#ebce86"
 LEFT, RIGHT = 510, 1110
@@ -157,6 +157,10 @@ class Canvas:
         """Draw one line of readable text."""
         self.draw.text((x * SCALE, y * SCALE), value, font=font(size, bold), fill=color)
 
+    def polygon(self, points: list[tuple[float, float]], fill: str) -> None:
+        """Draw a filled projected surface."""
+        self.draw.polygon([(round(x*SCALE),round(y*SCALE)) for x,y in points],fill=fill)
+
     def dot(self, x: float, y: float, radius: float, color: str) -> None:
         """Draw a tracer confined to a channel."""
         self.draw.ellipse(tuple(round(v * SCALE) for v in (x-radius, y-radius, x+radius, y+radius)), fill=color)
@@ -175,6 +179,19 @@ def tracer_positions(circuit: Circuit, time_s: float) -> list[float]:
             for n in range(count)]
 
 
+def iso(x: float, y: float, z: float) -> tuple[float,float]:
+    """Project orthogonal 3D axes at equal scale with true 30-degree isometry."""
+    return 500+math.sqrt(3)/2*(x+y),490+.5*(x-y)-z
+
+
+def prism(c: Canvas, x0: float, x1: float, y0: float, y1: float,
+          z0: float, z1: float, top: str, front: str, side: str) -> None:
+    """Draw a contiguous rectangular cutaway volume using one projection."""
+    c.polygon([iso(x0,y0,z0),iso(x1,y0,z0),iso(x1,y0,z1),iso(x0,y0,z1)],front)
+    c.polygon([iso(x1,y0,z0),iso(x1,y1,z0),iso(x1,y1,z1),iso(x1,y0,z1)],side)
+    c.polygon([iso(x0,y0,z1),iso(x1,y0,z1),iso(x1,y1,z1),iso(x0,y1,z1)],top)
+
+
 def render_frame(circuits: list[Circuit], membrane: dict[str, Any], time_s: float) -> Image.Image:
     """Render the same connected geometry at one real-time animation instant."""
     model = exchange_model(circuits)
@@ -182,89 +199,104 @@ def render_frame(circuits: list[Circuit], membrane: dict[str, Any], time_s: floa
     c.text(54, 30, "MAPPED ASSEMBLY  /  FORMA-OSS", 16, GOLD, True)
     c.text(52, 70, "Liver-chip concept: membrane exchange", 38, FG, True)
     c.text(54, 133, "Fluid flows downstream. Solute crosses the membrane along its concentration gradient.", 23, MUTED)
-    c.text(54, 205, "ASSEMBLED CROSS-SECTION", 16, GOLD, True)
-    c.text(54, 233, "Steady-state passive-solute model • schematic geometry • thickness exaggerated", 18, MUTED)
-    c.text(LEFT, 286, "PDMS housing", 16, MUTED)
-    # Only exterior walls are solid. Both channels meet opposite membrane faces.
-    c.box((LEFT, 319, RIGHT, 345), "#35465a")
-    c.box((LEFT, 481, RIGHT, 507), "#35465a")
-    for index, circuit in enumerate(circuits):
-        y, color = circuit.center, circuit.color
-        c.box((LEFT, circuit.top, RIGHT, circuit.bottom),
-              "#123a4e" if circuit.name == "epithelial" else "#472735")
-        # Gold shading is the computed cross-sectional solute concentration.
-        base = "#123a4e" if circuit.name == "epithelial" else "#472735"
-        for px in range(LEFT, RIGHT, 3):
-            cv, ce = model.concentrations((px-LEFT)/(RIGHT-LEFT)*circuit.length_mm)
-            concentration = ce if circuit.name == "epithelial" else cv
-            c.box((px, circuit.top, min(px+3, RIGHT), circuit.bottom), blend(base, GOLD, concentration))
-        # Continuous route: inlet → supply → pump → feed → chamber → main → waste.
-        c.line([(150, y), (420, y)], "#40516a", 18)
-        c.line([(150, y), (420, y)], color, 8)
-        c.line([(RIGHT, y), (1275, y)], "#40516a", 18)
-        c.line([(RIGHT, y), (1275, y)], color, 8)
-        c.box((110, y-19, 150, y+19), "#1a2b3f", color, 5)
-        c.box((245, y-20, 335, y+20), "#1a2b3f", color, 6)
-        c.text(258, y-11, "PUMP", 15, color, True)
-        # Chamber opens directly into the main channel, with no wall across the port.
-        inlet = model.epithelial_inlet_mm if circuit.name == "epithelial" else model.vascular_inlet_mm
-        c.box((420, circuit.top, LEFT, circuit.bottom), blend(base, GOLD, inlet))
-        c.line([(420, circuit.top), (RIGHT, circuit.top)], color, 2)
-        c.line([(420, circuit.bottom), (RIGHT, circuit.bottom)], color, 2)
-        c.box((1275, y-22, 1365, y+22), "#1a2b3f", color, 5)
-        c.text(1286, y-11, "WASTE", 15, color, True)
-        c.arrow(205, y, FG)
-        c.arrow(385, y, FG)
-        c.arrow(1202, y, FG)
-        # Clip at actual main-channel ports; never paint particles in solid walls.
-        for x in tracer_positions(circuit, time_s):
-            if LEFT + 5 <= x <= RIGHT - 5:
-                c.dot(x, y, 4, color)
-                c.dot(x, y, 1.5, FG)
-        c.text(LEFT + 20, circuit.top + 7 if circuit.name == "epithelial" else circuit.bottom - 20, circuit.name.upper(), 14, color, True)
-    # Membrane shares the exact channel boundaries, eliminating the exploded gaps.
-    c.box((LEFT, 411, RIGHT, 415), GOLD)
-    for x in range(LEFT+8, RIGHT, 16):
-        c.line([(x, 411), (x, 415)], "#9b8145")
-    # Gold glyphs show net flux direction; opacity follows the local solved flux.
-    # Their vertical motion is symbolic, not a molecular crossing-time prediction.
-    for i, px in enumerate(range(550, RIGHT-15, 50)):
-        x_mm = (px-LEFT)/(RIGHT-LEFT)*model.length_mm
-        flux = model.flux_nmol_mm2_s(x_mm)
-        maximum = abs(model.flux_nmol_mm2_s(0))
-        if maximum > 0 and abs(flux) > 1e-12:
-            strength = abs(flux)/maximum
-            shade = blend("#53442c", "#fff0b1", strength)
-            phase = (round(time_s/1.2, 10)+i/12) % 1
-            yy = 437-48*phase if flux > 0 else 389+48*phase
-            c.line([(px, 437), (px, 389)], shade, 1)
-            tip = 389 if flux > 0 else 437
-            tail = tip+6 if flux > 0 else tip-6
-            c.line([(px-4,tail),(px,tip),(px+4,tail)], GOLD, 2)
-            c.dot(px, yy, 2.5+strength, GOLD)
-    c.text(111, 330, f"{model.epithelial_inlet_mm:g} mM", 14, GOLD)
-    c.text(111, 400, f"{model.vascular_inlet_mm:g} mM", 14, GOLD)
-    c.text(108, 527, "Inlets", 16, MUTED)
-    c.text(243, 527, "Pumps", 16, MUTED)
-    c.text(410, 527, "Distribution", 16, MUTED)
-    c.text(410, 550, "chambers", 16, MUTED)
-    c.text(1275, 527, "Separate", 16, MUTED)
-    c.text(1275, 550, "collection", 16, MUTED)
-    c.text(530, 578, f"{membrane['material'].upper()} MEMBRANE  ·  10 µm", 17, GOLD, True)
-    c.text(530, 605, "Gold shading: solute concentration. Gold pulses: net solute exchange.", 17, MUTED)
-    c.text(54, 578, "J = P × (Cv − Ce)", 22, GOLD, True)
-    c.text(54, 612, f"Assumed P = {model.permeability_mm_s*1000:g} µm/s", 18, MUTED)
+    c.text(54, 205, "ISOMETRIC CUTAWAY", 16, GOLD, True)
+    c.text(54, 233, "Steady-state passive-solute model • transverse dimensions exaggerated", 18, MUTED)
+    # Tube endpoints use the same 3D projection as the exposed channel ports.
+    for circuit in circuits:
+        z = 103 if circuit.name == "epithelial" else 33
+        y = 490-z
+        inlet_port, outlet_port = iso(-90, 0, z), iso(600, 0, z)
+        feed = [(150,y),(345,y),(375,y),inlet_port]
+        waste = [outlet_port,(1190,outlet_port[1]),(1275,outlet_port[1])]
+        for route in (feed,waste):
+            c.line(route, "#40516a", 18)
+            c.line(route, circuit.color, 8)
+        c.box((110,y-19,150,y+19), "#1a2b3f", circuit.color,5)
+        c.box((245,y-20,335,y+20), "#1a2b3f", circuit.color,6)
+        c.text(258,y-11,"PUMP",15,circuit.color,True)
+        c.box((1275,outlet_port[1]-22,1365,outlet_port[1]+22),"#1a2b3f",circuit.color,5)
+        c.text(1286,outlet_port[1]-11,"WASTE",15,circuit.color,True)
+        c.arrow(205,y,FG)
+        c.arrow(1215,outlet_port[1],FG)
+        concentration = model.epithelial_inlet_mm if circuit.name == "epithelial" else model.vascular_inlet_mm
+        c.text(111,y-48,f"{concentration:g} mM",14,GOLD)
+    # Draw back-to-front: lower housing, vascular lumen, membrane, upper lumen.
+    prism(c,0,600,0,120,-26,0,"#34465c","#243248","#40546b")
+    for name,z0,z1,base,color in (("vascular",0,66,"#472735",CORAL),
+                                  ("epithelial",70,136,"#123a4e",BLUE)):
+        if name == "epithelial":
+            prism(c,0,600,0,120,66,70,GOLD,"#bfa466","#9b8145")
+            for x in range(12,600,18):
+                c.line([iso(x,0,66),iso(x,0,70)],"#8d7546")
+        # The enlarged distribution chamber is contiguous with its main lumen.
+        inlet = model.vascular_inlet_mm if name == "vascular" else model.epithelial_inlet_mm
+        prism(c,-90,0,0,120,z0,z1,blend(base,GOLD,inlet),blend(base,GOLD,inlet),color)
+        for x in range(0,600,4):
+            cv,ce=model.concentrations(x/30)
+            shade=blend(base,GOLD,cv if name == "vascular" else ce)
+            # Both the cut face and open top show the same solved concentration.
+            c.polygon([iso(x,0,z0),iso(x+4,0,z0),iso(x+4,0,z1),iso(x,0,z1)],shade)
+            c.polygon([iso(x,0,z1),iso(x+4,0,z1),iso(x+4,120,z1),iso(x,120,z1)],shade)
+        c.polygon([iso(600,0,z0),iso(600,120,z0),iso(600,120,z1),iso(600,0,z1)],blend(base,GOLD,model.concentrations(20)[0 if name == "vascular" else 1]))
+        for z in (z0,z1):
+            c.line([iso(-90,0,z),iso(600,0,z)],color,2)
+        # Exposed back housing rail indicates the removed cover/cut wall.
+        prism(c,0,600,110,120,z1,z1+18,"#40546b","#27394e","#536881")
+        circuit=next(item for item in circuits if item.name == name)
+        for screen_x in tracer_positions(circuit,time_s):
+            along=screen_x-LEFT
+            if 5<=along<=595:
+                px,py=iso(along,0,(z0+z1)/2)
+                c.dot(px,py,4,color)
+                c.dot(px,py,1.5,FG)
+        lx,ly=iso(25,0,z1-13 if name == "epithelial" else 13)
+        c.text(lx,ly,name.upper(),14,color,True)
+    # Render outlet fittings over the exposed end face, with tubes leaving along
+    # the projected channel axis before bending toward their collection vessels.
+    for circuit in circuits:
+        z = 103 if circuit.name == "epithelial" else 33
+        port, exit_point = iso(600,60,z), iso(660,60,z)
+        route = [port,exit_point,(1190,exit_point[1]),(1275,exit_point[1])]
+        c.line(route,"#40516a",18)
+        c.line(route,circuit.color,8)
+        c.dot(*port,9,"#0c1522")
+        c.dot(*port,5,circuit.color)
+        c.arrow(1215,exit_point[1],FG)
+    # Preserve the membrane-normal flux arrows and their solved strength.
+    for i,x in enumerate(range(40,590,50)):
+        flux=model.flux_nmol_mm2_s(x/30)
+        maximum=abs(model.flux_nmol_mm2_s(0))
+        if maximum>0 and abs(flux)>1e-12:
+            strength=abs(flux)/maximum
+            shade=blend("#53442c","#fff0b1",strength)
+            phase=(round(time_s/1.2,10)+i/12)%1
+            z=44+48*phase if flux>0 else 92-48*phase
+            c.line([iso(x,0,44),iso(x,0,92)],shade)
+            tip=iso(x,0,92 if flux>0 else 44)
+            tail_y=tip[1]+6 if flux>0 else tip[1]-6
+            c.line([(tip[0]-4,tail_y),tip,(tip[0]+4,tail_y)],GOLD,2)
+            c.dot(*iso(x,0,z),2.5+strength,GOLD)
+    c.text(108,530,"Inlets",16,MUTED)
+    c.text(243,530,"Pumps",16,MUTED)
+    c.text(375,590,"Distribution",16,MUTED)
+    c.text(375,613,"chambers",16,MUTED)
+    c.text(1260,803,"Separate waste",16,MUTED)
+    c.text(1050,310,"Cover cut away",16,MUTED)
+    c.text(530,864,f"{membrane['material'].upper()} MEMBRANE  ·  10 µm",17,GOLD,True)
+    c.text(530,893,"Gold shading: solute concentration. Gold pulses: net solute exchange.",17,MUTED)
+    c.text(54,864,"J = P × (Cv − Ce)",22,GOLD,True)
+    c.text(54,900,f"Assumed P = {model.permeability_mm_s*1000:g} µm/s",18,MUTED)
     for circuit, x in zip(circuits, (54, 735)):
-        c.box((x, 669, x+651, 810), "#142337", "#2b3c51", 12)
-        c.text(x+22, 686, circuit.name.title(), 22, circuit.color, True)
-        c.text(x+22, 728, f"{circuit.flow_ul_min:g} µL/min", 28, FG, True)
-        c.text(x+230, 731, f"{circuit.speed_mm_s:.2f} mm/s", 22, FG)
-        c.text(x+446, 731, f"{circuit.transit_s:g} s transit", 22, FG)
+        c.box((x, 959, x+651, 1100), "#142337", "#2b3c51", 12)
+        c.text(x+22, 976, circuit.name.title(), 22, circuit.color, True)
+        c.text(x+22, 1018, f"{circuit.flow_ul_min:g} µL/min", 28, FG, True)
+        c.text(x+230, 1021, f"{circuit.speed_mm_s:.2f} mm/s", 22, FG)
+        c.text(x+446, 1021, f"{circuit.transit_s:g} s transit", 22, FG)
         cv, ce = model.concentrations(model.length_mm)
         outlet = ce if circuit.name == "epithelial" else cv
-        c.text(x+22, 771, f"Solute outlet: {outlet:.3f} mM", 19, GOLD)
-    c.text(54, 826, "20 × 1 × 0.2 mm channels  ·  Solute mass conserved  ·  Fluid tracers: real time; exchange pulses: symbolic", 17, MUTED)
-    c.text(54, 862, "Illustrative permeability and concentrations. 1D transport model; no cell response, CFD, or toxicity prediction.", 16, MUTED)
+        c.text(x+22, 1061, f"Solute outlet: {outlet:.3f} mM", 19, GOLD)
+    c.text(54, 1116, "20 × 1 × 0.2 mm channels  ·  Solute mass conserved  ·  Fluid tracers: real time; exchange pulses: symbolic", 17, MUTED)
+    c.text(54, 1152, "Illustrative permeability and concentrations. 1D transport model; no cell response, CFD, or toxicity prediction.", 16, MUTED)
     return c.image.resize((W, H), Image.Resampling.LANCZOS)
 
 

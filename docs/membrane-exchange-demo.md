@@ -1,6 +1,7 @@
 # Membrane exchange preview
 
-The GIF couples the two declared 20 × 1 × 0.2 mm channels through passive
+The GIF uses an isometric cutaway with shared projected ports and membrane interfaces.
+Transverse dimensions are exaggerated for visibility. The model couples the two declared 20 × 1 × 0.2 mm channels through passive
 solute exchange across their shared 10 µm porous PET membrane. Bulk flow stays
 in each circuit; solute moves down the concentration gradient. The calculation
 is a steady-state, 1D co-current plug-flow model, not CFD or biological validation.

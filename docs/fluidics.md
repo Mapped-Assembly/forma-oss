@@ -145,7 +145,7 @@ specifications, and an intentionally broken network:
 
 ![Two-channel organ-chip flow schematic](assets/organ-on-chip-flow.gif)
 
-This application-specific GIF is an assembled cross-section rendered from the
+This application-specific GIF is an assembled isometric cutaway rendered from the
 checked example JSON. The two continuous inlet → pump → distribution chamber →
 main channel → waste circuits contact opposite faces of the porous membrane.
 It is not a CAD export or CFD result. Geometry is schematic and thickness is
